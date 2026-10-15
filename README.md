@@ -1,6 +1,6 @@
 # 🎓 Assist DLA Mil Documentation
 
-<img width="800" height="148" alt="welcome_new_middle" src="https://github.com/user-attachments/assets/3ad7ba82-6b2c-4aae-9899-09f9151bd0b6" />
+<img width="800" height="148" alt="welcome_new_middle" src="https://raw.githubusercontent.com/PrajwalKoirala638/assist-dla-mil-documentation/refs/heads/main/Assets/welcome_new_middle.gif" />
 
 
 ### A friendly, organized home for education and benefits documents — built to help everyone, in every field, everywhere.
