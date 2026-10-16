@@ -1,24 +1,21 @@
 # ASSIST (assist.dla.mil) PDF downloader - never-stop version: no arguments, every error is logged and skipped.
 # Everything (pages, login checks and PDF downloads) goes through Chrome, so only the browser has to be logged in.
-# Optional: ASSIST_LOG_FILE (rotating log file) and ASSIST_ALERT_WEBHOOK (message when the script waits for you).
 # Every ID is checked again on every run (new PDFs can appear later); files that are already saved are never requested again.
 # Requires Python 3.13 or newer.
 
 import errno  # Recognise the "disk is full" operating system error
 import hashlib  # Fingerprint every saved PDF
-import json  # Progress file, manifest and webhook message
+import json  # Webhook message
 import logging  # Console logging
-import logging.handlers  # Rotating log file
-import os  # Environment variables and fsync
+import os  # Operating system name
 import queue  # Pass typed lines from the keyboard thread to the main thread
 import random  # Jitter for the pauses between requests
 import re  # Text pattern matching
 import shutil  # Measure the free disk space
 import sqlite3  # Local database of everything seen and saved in earlier runs
 import sys  # Standard input and output
-import threading  # Keyboard reader, heartbeat and webhook threads
+import threading  # Keyboard reader thread
 import time  # Pauses and timing
-import urllib.request  # Post the optional webhook alert
 from collections.abc import (
     Callable,
     Iterator,
@@ -53,7 +50,7 @@ type AttemptFunction = Callable[
 ]  # One attempt of a retried operation (called with attempt_label=...)
 type BodyValidator = Callable[
     ..., None
-]  # Checks a page (called with response=..., response_body=...)
+]  # Checks a page (called with response_body=...)
 
 
 class DocumentRecord(TypedDict):  # One row of the results grid
@@ -82,7 +79,7 @@ class FailureRecord:  # One recorded problem
 class FailedDocument:  # A document that will be retried
     record: DocumentRecord  # The grid row of the document
     label: str  # The ORIGINAL log label (retry suffixes are added only when logging)
-    page_number: int  # The results page the document was found on
+    attempts: int  # How many times the document has failed so far
 
 
 @dataclass(
@@ -106,8 +103,11 @@ JITTER_MINIMUM_FACTOR = (
 JITTER_MAXIMUM_FACTOR = 1.3  # ... and at most this
 SHOW_BROWSER_WINDOW = True  # True makes the browser visible to the user
 BROWSER_LAUNCH_ARGUMENTS = [
-    "--start-maximized"
-]  # Chrome opens maximized (full screen size), never minimized
+    "--start-maximized",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--noerrdialogs",
+]  # Chrome opens maximized (never minimized) and never shows the "Restore pages?" bubble or error dialogs
 BROWSER_IGNORED_DEFAULT_ARGUMENTS = [
     "--enable-automation",
     "--password-store=basic",
@@ -138,9 +138,7 @@ MAXIMUM_PAGING_BACKOFF_SECONDS = (
 FINAL_RETRY_ROUNDS = (
     1  # Extra rounds spent on documents that failed (every retry costs requests)
 )
-MAXIMUM_RELOGINS_PER_REQUEST = (
-    3  # How many times one download may ask you to log in again
-)
+KEEP_ALIVE_SECONDS = 240  # The browser requests a small page this often, so the session does not time out (also during long downloads)
 CIRCUIT_BREAKER_FAILURES = 5  # This many failed documents in a row pauses the run
 CIRCUIT_BREAKER_BASE_SECONDS = (
     30  # First breaker pause (doubles with every trip in a row)
@@ -148,7 +146,6 @@ CIRCUIT_BREAKER_BASE_SECONDS = (
 PROMPT_REPEAT_SECONDS = (
     600  # A waiting prompt is shown (and signalled) again every 10 minutes
 )
-HEARTBEAT_SECONDS = 300  # Print a "still running" line every 5 minutes
 REFUSED_RECHECK_HOURS = (
     24  # A file the server refused is not requested again for this many hours
 )
@@ -157,22 +154,23 @@ BYTES_PER_MEGABYTE = 1024 * 1024  # Number of bytes in one megabyte
 RETRY_ATTEMPTS = 3  # Number of times to retry a failed operation
 SECONDS_PER_RETRY_STEP = 2  # Base backoff time in seconds for retries
 PROGRESS_EVERY_N_DOCUMENTS = 25  # Frequency of progress totals
+RESUME_FROM_SAVED_PAGE = True  # True: after a restart or crash, continue at the results page saved in the database (False: always start at page 1)
+RESUME_KEY = "results_page"  # Name of the row in the resume table
+PAGES_BETWEEN_SKIP_LOGS = (
+    10  # While paging forward to the saved page, log every this many pages
+)
+PAGING_MAXIMUM_ROUNDS = 5  # Rounds of attempts to page to or read a results page before the run stops with an error
+RETRY_FAILED_EVERY_N_PAGES = (
+    5  # Failed documents are retried after every this many results pages
+)
+MAXIMUM_DOCUMENT_ATTEMPTS = 3  # Failed documents are retried during the run until they failed this often (the final round tries all)
 REQUEST_TIMEOUT_MS = 120_000  # Network timeout in milliseconds
 KEYBOARD_POLL_MS = 300  # Polling interval for keyboard input in milliseconds
 CLOSED_INPUT_WAIT_SECONDS = (
     5  # If terminal input is closed, prompts continue by themselves after this long
 )
-LOG_FILE_ENV_NAME = (
-    "ASSIST_LOG_FILE"  # Environment variable that switches on the log file
-)
-LOG_FILE_MAXIMUM_BYTES = 10 * 1024 * 1024  # Rotate the log file after 10 MB
-LOG_FILE_BACKUP_COUNT = 5  # Rotated log files to keep
 LOG_LINE_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"  # Layout of a log line
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"  # Layout of the time in a log line
-ALERT_WEBHOOK_ENV_NAME = (
-    "ASSIST_ALERT_WEBHOOK"  # Environment variable with the optional webhook URL
-)
-WEBHOOK_TIMEOUT_SECONDS = 10  # Give up on a webhook call after this long
 HASH_CHUNK_BYTES = 1024 * 1024  # Piece size when hashing a saved PDF
 MAXIMUM_NON_PDF_BYTES = (
     2 * 1024 * 1024
@@ -200,7 +198,6 @@ NO_RESULTS_REMINDER = (  # Shown when the results grid is missing
     "\n   I cannot see the results grid. Select Advanced Search, click Search,\n"  # Explain what to do
     "   wait for the results to appear, then press Enter here..."  # Prompt
 )  # End of the reminder
-LOGIN_TAB_MESSAGE = "\n>> Log in in the new browser tab, then press Enter here..."  # Shown when a new log-in is needed
 
 # ===========================================================================
 # WEBSITE DETAILS
@@ -210,6 +207,19 @@ START_PAGE_URL = BASE_URL + "/online/start/"  # Log-in / start page
 SEARCH_PAGE_URL = (
     BASE_URL + "/AssistNet/Analyse/FilteredSearchA.aspx"
 )  # Page that is opened after the log-in to run the search
+KEEP_ALIVE_PATH = "/online/doc_analysis/doc_info_general.cfm?ident_number=2"  # A small read-only page the browser requests now and then (the search page is never touched)
+KEEP_ALIVE_JAVASCRIPT = (  # Runs inside every page of the site: the browser itself pings, so it works while Python waits for a download
+    "(() => {"  # Start of the function
+    "if (window.top !== window || location.hostname !== "
+    + json.dumps(urlparse(url=BASE_URL).hostname)
+    + " || window.__assistKeepAlive) { return; }"  # Only the top page of the site, only once per page
+    "window.__assistKeepAlive = setInterval(() => {"  # Repeat forever
+    "fetch("
+    + json.dumps(KEEP_ALIVE_PATH)
+    + ", {credentials: 'include', cache: 'no-store'}).catch(() => {});"  # Request the small page with the log-in cookies
+    "}, " + str(KEEP_ALIVE_SECONDS * 1000) + ");"  # Every KEEP_ALIVE_SECONDS
+    "})();"  # End of the function
+)  # End of the script
 PASSWORD_FIELD_SELECTOR = (
     "input[type='password']"  # The password field of a log-in form
 )
@@ -255,6 +265,11 @@ DATABASE_SCHEMA = (  # Creates the tables on first use
     "CREATE TABLE IF NOT EXISTS refused ("  # Files the server refused to send
     "ident TEXT NOT NULL, dmxid TEXT NOT NULL, url TEXT NOT NULL, refused_at TEXT NOT NULL, reason TEXT NOT NULL, "  # What and when
     "PRIMARY KEY (ident, dmxid));"  # One row per refused file
+    "CREATE TABLE IF NOT EXISTS resume ("  # The results page where the last run stopped
+    "name TEXT PRIMARY KEY, page_number INTEGER NOT NULL, total_pages INTEGER NOT NULL, updated_at TEXT NOT NULL);"  # Which page, of how many, when
+    "CREATE TABLE IF NOT EXISTS suspect_checks ("  # Incomplete-looking files that were downloaded a second time
+    "ident TEXT NOT NULL, dmxid TEXT NOT NULL, checked_at TEXT NOT NULL, "  # Which file and when
+    "PRIMARY KEY (ident, dmxid));"  # One row per file
 )  # End of the schema
 PDF_FILE_EXTENSION = ".pdf"  # Extension of downloaded files
 PARTIAL_FILE_EXTENSION = ".part"  # Extension of a file that is still being written
@@ -265,12 +280,6 @@ SUSPECT_MARKER = (
 # ===========================================================================
 # FILE NAMES
 # ===========================================================================
-SAFE_NAME_PATTERN = re.compile(
-    pattern=r"[^A-Za-z0-9.\-]+"
-)  # Characters that are not allowed in names
-NAME_FIELD_SEPARATOR = "_"  # Separates the parts of a file name
-NAME_REPLACEMENT_CHARACTER = "_"  # Replaces invalid characters
-NAME_EDGE_CHARACTERS = "_."  # Characters that must not start or end a name
 RESERVED_WINDOWS_NAMES = frozenset(  # Names that Windows refuses for files and folders
     {"CON", "PRN", "AUX", "NUL"}  # Device names
     | {f"COM{number}" for number in range(1, 10)}  # Serial ports
@@ -359,9 +368,7 @@ PDF_SIGNATURE = b"%PDF-"  # Start of every PDF
 PDF_END_MARKER = b"%%EOF"  # End of every complete PDF
 NON_BREAKING_SPACE = "\xa0"  # Non-breaking space character used in HTML
 PDF_SIGNATURE_SEARCH_BYTES = 1024  # Bytes read when looking for the PDF signature
-PDF_END_SEARCH_BYTES = (
-    2048  # Bytes read at the end of a file when looking for the end marker
-)
+PDF_END_SEARCH_BYTES = 8192  # Bytes read at the end of a file when looking for the end marker (some PDFs have a long trailer)
 LOGIN_PAGE_SEARCH_BYTES = 5000  # Bytes read when looking for a login page
 RETRY_AFTER_HEADER_NAME = "retry-after"  # Header that tells how long to wait
 HTTP_RETRYABLE_STATUSES = {
@@ -395,6 +402,9 @@ class Totals:  # Running counters and shared state
     browser_closed: bool = (
         False  # True when Chrome died or was closed (then the session restarts)
     )
+    stopped_early: bool = (
+        False  # True when the run stopped because paging or reading a results page failed for good
+    )
     consecutive_failures: int = 0  # Failed documents in a row (circuit breaker)
     breaker_trips: int = 0  # Breaker trips in a row (grows the pause)
     work_page: Page | None = (
@@ -406,7 +416,6 @@ class Totals:  # Running counters and shared state
     first_run: bool = (
         False  # True when the database was empty at the start (then nothing is announced as new)
     )
-    waiting_for_user: bool = False  # True while a prompt waits for you
     started_at: float = field(
         default_factory=time.monotonic
     )  # Moment the script started
@@ -436,7 +445,6 @@ logger = logging.getLogger(
 )  # The named logger (handlers are added in setup_logging)
 stdin_lines: queue.Queue[str] = queue.Queue()  # Every line typed in the terminal
 stdin_state = {"started": False, "closed": False}  # Keyboard thread state
-heartbeat_stop = threading.Event()  # Set at the end of the run to stop the heartbeat
 
 
 # ===========================================================================
@@ -471,6 +479,12 @@ class RefusedDownloadError(
 
 
 class BrowserLostError(Exception):  # The browser tab or window is gone
+    pass  # No custom logic needed
+
+
+class PagingFailedError(
+    Exception
+):  # Paging to or reading a results page failed for good (the run stops)
     pass  # No custom logic needed
 
 
@@ -565,75 +579,10 @@ def setup_logging() -> None:  # Log to the screen and optionally to a rotating f
     screen_handler = logging.StreamHandler(stream=sys.stdout)  # Writes to the terminal
     screen_handler.setFormatter(fmt=log_format)  # Apply the layout
     logger.addHandler(hdlr=screen_handler)  # Attach the handler
-    log_file_name = os.environ.get(
-        LOG_FILE_ENV_NAME, ""
-    ).strip()  # Is the optional log file switched on?
-    if not log_file_name:  # No log file wanted
-        return  # Nothing more to set up
-    try:  # The file may not be writable
-        file_handler = logging.handlers.RotatingFileHandler(
-            filename=log_file_name,
-            maxBytes=LOG_FILE_MAXIMUM_BYTES,
-            backupCount=LOG_FILE_BACKUP_COUNT,
-            encoding="utf-8",
-        )  # Rotates when big
-        file_handler.setFormatter(fmt=log_format)  # Apply the same layout
-        logger.addHandler(hdlr=file_handler)  # Attach the handler
-        logger.info(msg=f"Also logging to {log_file_name}")  # Tell the user
-    except OSError as error:  # The file cannot be opened
-        logger.warning(
-            msg=f"Could not open the log file {log_file_name}: {error}"
-        )  # Carry on with the screen only
 
 
-def send_webhook_alert(
-    *, text: str
-) -> None:  # Post a message to the optional webhook (never blocks, never fails)
-    webhook_url = os.environ.get(
-        ALERT_WEBHOOK_ENV_NAME, ""
-    ).strip()  # Read the webhook address
-    if not webhook_url:  # No webhook configured
-        return  # Nothing to do
-    if not webhook_url.lower().startswith(
-        ("http://", "https://")
-    ):  # Only web addresses are allowed (no file: URLs)
-        logger.warning(
-            msg=f"{ALERT_WEBHOOK_ENV_NAME} must start with http:// or https://"
-        )  # Explain the problem
-        return  # Do not call it
-
-    def post_message() -> None:  # The work of the background thread
-        try:  # The network can fail
-            payload = json.dumps(obj={"text": text, "content": text}).encode(
-                encoding="utf-8"
-            )  # "text" suits Slack, "content" Discord
-            request = urllib.request.Request(
-                url=webhook_url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )  # Build the request
-            with urllib.request.urlopen(
-                url=request, timeout=WEBHOOK_TIMEOUT_SECONDS
-            ):  # Send it
-                pass  # The answer does not matter
-        except Exception as error:  # Nothing here may disturb the run
-            logger.warning(
-                msg=f"Webhook alert failed: {error}"
-            )  # Log it (never the URL: it may be a secret)
-
-    threading.Thread(
-        target=post_message, name="alert-webhook", daemon=True
-    ).start()  # Send in the background
-
-
-def notify_user(
-    *, text: str
-) -> None:  # Draw attention to a waiting prompt: terminal bell plus optional webhook
+def notify_user() -> None:  # Draw attention to a waiting prompt with the terminal bell
     print("\a", end="", flush=True)  # Ring the terminal bell
-    send_webhook_alert(
-        text=f"assist downloader: {text}"
-    )  # Send the optional webhook message
 
 
 def wait_for_disk_space() -> None:  # PAUSE (never stop) while the disk is too full
@@ -671,22 +620,6 @@ def run_preflight_checks() -> (
         logger.warning(
             msg=f"Could not measure the free disk space: {error}"
         )  # Warn only
-
-
-def heartbeat_loop() -> None:  # Prove that the script is still alive
-    while not heartbeat_stop.wait(
-        timeout=HEARTBEAT_SECONDS
-    ):  # Wait, and leave as soon as the stop event is set
-        if not totals.waiting_for_user:  # Stay quiet while a prompt waits for you
-            logger.info(
-                msg=f"Still running. {totals_summary()}"
-            )  # Print the running totals
-
-
-def start_heartbeat_thread() -> None:  # Run the heartbeat in its own thread
-    threading.Thread(
-        target=heartbeat_loop, name="heartbeat", daemon=True
-    ).start()  # Daemon: never blocks the exit
 
 
 # ===========================================================================
@@ -844,6 +777,113 @@ def record_file(
                 "DELETE FROM refused WHERE ident = ? AND dmxid = ?",
                 (document_record["ident"], pdf_link["dmxid"]),
             )  # A saved file is no longer refused
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+
+
+def suspect_already_retried(
+    *, ident: str, dmxid: str
+) -> bool:  # Was this incomplete-looking file already downloaded a second time?
+    try:  # The database can fail
+        row = (
+            get_database()
+            .execute(
+                "SELECT 1 FROM suspect_checks WHERE ident = ? AND dmxid = ?",
+                (ident, dmxid),
+            )
+            .fetchone()
+        )  # Look it up
+        return row is not None  # Known if a row exists
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not query {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+        return True  # Treat it as checked, so nothing is downloaded again and again
+
+
+def record_suspect_check(
+    *, document_record: DocumentRecord, pdf_link: PdfLink
+) -> None:  # Remember that an incomplete-looking file was downloaded a second time
+    try:  # The database can fail
+        with get_database() as connection:  # One transaction (committed on success)
+            connection.execute(
+                "INSERT OR REPLACE INTO suspect_checks (ident, dmxid, checked_at) VALUES (?, ?, ?)",
+                (
+                    document_record["ident"],
+                    pdf_link["dmxid"],
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )  # Insert or replace the row of this file
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+
+
+def clear_suspect_check(
+    *, document_record: DocumentRecord, pdf_link: PdfLink
+) -> None:  # Forget the second-download mark of a file that is complete now
+    try:  # The database can fail
+        with get_database() as connection:  # One transaction (committed on success)
+            connection.execute(
+                "DELETE FROM suspect_checks WHERE ident = ? AND dmxid = ?",
+                (document_record["ident"], pdf_link["dmxid"]),
+            )  # Remove the row of this file
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+
+
+def load_resume_page() -> (
+    int | None
+):  # Which results page did the last run stop at? (None if unknown)
+    if not RESUME_FROM_SAVED_PAGE:  # Resuming is switched off
+        return None  # Start at the page the browser shows
+    try:  # The database can fail
+        row = (
+            get_database()
+            .execute("SELECT page_number FROM resume WHERE name = ?", (RESUME_KEY,))
+            .fetchone()
+        )  # Look up the saved page
+        return int(row[0]) if row else None  # The saved page, if there is one
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not query {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+        return None  # Start at the page the browser shows
+
+
+def save_resume_page(
+    *, page_number: int, total_pages: int
+) -> None:  # Remember the results page that is being worked on now
+    try:  # The database can fail
+        with get_database() as connection:  # One transaction (committed on success)
+            connection.execute(
+                "INSERT OR REPLACE INTO resume (name, page_number, total_pages, updated_at) VALUES (?, ?, ?, ?)",
+                (
+                    RESUME_KEY,
+                    page_number,
+                    total_pages,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )  # Insert or replace the single resume row
+    except sqlite3.Error as error:  # The database cannot be used
+        logger.warning(
+            msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
+        )  # Warn and carry on
+
+
+def clear_resume_page() -> (
+    None
+):  # Forget the saved page (the whole search was finished)
+    try:  # The database can fail
+        with get_database() as connection:  # One transaction (committed on success)
+            connection.execute(
+                "DELETE FROM resume WHERE name = ?", (RESUME_KEY,)
+            )  # Remove the resume row
     except sqlite3.Error as error:  # The database cannot be used
         logger.warning(
             msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
@@ -1048,16 +1088,20 @@ def make_safe_name_part(
     *, text: str | None, maximum_length: int, fallback: str
 ) -> str:  # Sanitise a string for use in a path
     # Keep original casing, just ensure it's a string
-    raw_text = str(text or "")
+    raw_text = str(text or "")  # Make sure it is a string
 
     # Replace absolutely everything that is not A-Z, a-z, 0-9, or _ with a single _
-    cleaned_text = re.sub(pattern=r"[^A-Za-z0-9_]", repl="_", string=raw_text)
+    cleaned_text = re.sub(
+        pattern=r"[^A-Za-z0-9_]", repl="_", string=raw_text
+    )  # Replace everything except A-Z, a-z, 0-9 and _ with _
 
     # Collapse multiple underscores into a single underscore
-    cleaned_text = re.sub(pattern=r"_+", repl="_", string=cleaned_text)
+    cleaned_text = re.sub(
+        pattern=r"_+", repl="_", string=cleaned_text
+    )  # Collapse repeated underscores
 
     # Strip underscores from the edges so it never starts or ends with _
-    cleaned_text = cleaned_text.strip("_")
+    cleaned_text = cleaned_text.strip("_")  # Remove underscores at both ends
 
     shortened_text = cleaned_text[:maximum_length]  # Cut to the maximum length
     cut_inside_a_word = (
@@ -1082,7 +1126,7 @@ def make_safe_name_part(
             safe_text + "_SAFE"
         )  # Append _SAFE so we don't start with an underscore
 
-    return safe_text
+    return safe_text  # Hand the safe text back
 
 
 def format_date(
@@ -1115,16 +1159,22 @@ def build_folder_name(
         fallback=fallback_name,
     )  # Sanitised document ID
 
-    return folder_name
+    return folder_name  # Hand the folder name back
 
 
 def build_file_name(
     *, document_folder: Path, pdf_link: PdfLink
 ) -> str:  # File name of a PDF (the folder already carries the document ID)
     # Format the date and strictly clean it to A-Z, a-z, 0-9, and _
-    date_part = format_date(date_text=pdf_link["date"])
-    date_part = re.sub(pattern=r"[^A-Za-z0-9_]", repl="_", string=date_part)
-    date_part = re.sub(pattern=r"_+", repl="_", string=date_part).strip("_")
+    date_part = format_date(
+        date_text=pdf_link["date"]
+    )  # The date as YYYY-MM-DD (or cleaned text)
+    date_part = re.sub(
+        pattern=r"[^A-Za-z0-9_]", repl="_", string=date_part
+    )  # Keep only A-Z, a-z, 0-9 and _
+    date_part = re.sub(pattern=r"_+", repl="_", string=date_part).strip(
+        "_"
+    )  # Collapse repeated underscores and trim the ends
 
     number_part = make_safe_name_part(
         text=pdf_link["dmxid"],
@@ -1160,10 +1210,14 @@ def build_file_name(
     )  # Sanitised description
 
     # Join the parts using underscores (filtering out any empty parts)
-    file_name_base = "_".join(filter(None, [description_part, date_part, number_part]))
+    file_name_base = "_".join(
+        filter(None, [description_part, date_part, number_part])
+    )  # Join the parts with underscores
 
     # Final safety pass: no double underscores, and NO underscores right before the .pdf
-    file_name_base = re.sub(r"_+", "_", file_name_base).strip("_")
+    file_name_base = re.sub(r"_+", "_", file_name_base).strip(
+        "_"
+    )  # No double underscores and none at the ends
 
     file_name = file_name_base + PDF_FILE_EXTENSION  # Join the parts
     assert (
@@ -1259,7 +1313,7 @@ def looks_like_login_page(
 
 
 def validate_detail_page(
-    *, response: Response, response_body: bytes
+    *, response_body: bytes
 ) -> None:  # Check a document page is real and logged in
     if not response_body.strip():  # The page is empty
         raise RetryableFetchError(
@@ -1371,89 +1425,37 @@ def page_shows_logout_link(
         return False  # Treat it as "not shown"
 
 
-def is_logged_in(
-    *, browser_context: BrowserContext
-) -> bool:  # Is the session authenticated? (costs one request)
-    return (
-        check_site_state(browser_context=browser_context) == SITE_OK
-    )  # Only "up and logged in" counts
-
-
-def ensure_login(
-    *, browser_context: BrowserContext
-) -> bool:  # Prompt the user to log in if needed; True if a log-in was needed
-    if is_logged_in(
-        browser_context=browser_context
-    ):  # Already logged in (the one request that cannot be avoided)
-        return False  # Nothing was needed
-    login_page = (
-        browser_context.new_page()
-    )  # A NEW tab, so the results grid tab is never navigated away
-    try:  # The extra tab must always be closed
-        logger.info(msg="Please log in again in the browser window")  # Notify the user
-        try:  # The start page may not load
-            login_page.goto(
-                url=START_PAGE_URL, timeout=REQUEST_TIMEOUT_MS
-            )  # Open the login page
-        except PlaywrightError as error:  # The page did not load
-            logger.warning(
-                msg=f"Could not open the log-in page: {error}"
-            )  # Tell the user
-        wait_for_enter(
-            browser_page=login_page, message=LOGIN_TAB_MESSAGE
-        )  # Wait until the user has logged in
-        while not (
-            page_shows_logout_link(page=login_page)
-            or is_logged_in(browser_context=browser_context)
-        ):  # Look at the open tab first, ask the server only if needed
-            wait_for_enter(
-                browser_page=login_page, message=NOT_LOGGED_IN_REMINDER
-            )  # Remind the user
-    finally:  # Always runs
-        try:  # Closing can fail
-            login_page.close()  # Close the extra tab
-        except PlaywrightError:  # Already closed
-            pass  # Nothing more to do
-    logger.info(msg="Login OK")  # Log the success
-    return True  # A log-in was needed and is done
-
-
 def handle_login_problem(
     *,
     browser_context: BrowserContext,
     label: str,
     error: Exception,
-    relogins: int,
     backoff_seconds: float,
-) -> bool:  # React to a 401/403; True if a log-in happened
-    if isinstance(error, ForbiddenError) and is_logged_in(
+) -> (
+    None
+):  # React to a 401/403: if we are logged out, restart the browser; otherwise carry on
+    site_state = check_site_state(
         browser_context=browser_context
+    )  # Is the site up and are we logged in?
+    if site_state == SITE_LOGGED_OUT:  # The session really ended
+        raise BrowserLostError(
+            f"{label}: logged out"
+        )  # Close the browser and start over with an automatic log-in
+    if site_state == SITE_OK and isinstance(
+        error, ForbiddenError
     ):  # A 403 while the session is fine
         raise PermanentFetchError(
             f"{label}: access denied (HTTP 403) although the session is valid"
         ) from error  # This file is off limits
-    if relogins > MAXIMUM_RELOGINS_PER_REQUEST:  # Logging in again does not help
-        raise PermanentFetchError(
-            f"{label}: still logged out after {relogins - 1} log-ins"
-        ) from error  # Give up on this request only
-    try:  # The log-in itself can hit a browser problem
-        login_was_needed = ensure_login(
-            browser_context=browser_context
-        )  # Let the user log in if needed
-    except PlaywrightError as login_error:  # The browser failed during the log-in
-        logger.warning(msg=f"{label}: log-in failed: {login_error}")  # Tell the user
-        time.sleep(backoff_seconds)  # Wait a little
-        return True  # Do not count this attempt (relogins is limited anyway)
-    if not login_was_needed:  # The session looked fine
-        time.sleep(backoff_seconds)  # Pause instead of hammering the server
-    return login_was_needed  # Tell the caller whether a log-in happened
+    time.sleep(
+        backoff_seconds
+    )  # False alarm or the site is down: pause, then try again
 
 
 def run_with_retries(
     *, browser_context: BrowserContext, label: str, attempt_function: AttemptFunction
 ) -> Any:  # The ONE retry loop every download uses
     last_problem = "unknown problem"  # The most recent problem, for the final message
-    relogins = 0  # How often this request needed a new log-in
     attempt_number = 0  # Normal attempts made
     while attempt_number < RETRY_ATTEMPTS:  # Try up to RETRY_ATTEMPTS times
         attempt_number += 1  # Count this attempt
@@ -1473,15 +1475,12 @@ def run_with_retries(
         ) as error:  # We may have been logged out
             last_problem = str(error)  # Remember the problem
             logger.warning(msg=f"{label}: {error}")  # Tell the user
-            relogins += 1  # Count the log-in request
-            if handle_login_problem(
+            handle_login_problem(
                 browser_context=browser_context,
                 label=label,
                 error=error,
-                relogins=relogins,
                 backoff_seconds=backoff_seconds,
-            ):  # A log-in happened
-                attempt_number -= 1  # A log-in does not use up a normal attempt
+            )  # Restarts the browser if we are logged out, otherwise pauses
             continue  # Try again (the pause was already made)
         except RetryableFetchError as error:  # A temporary server problem
             last_problem = str(error)  # Remember the problem
@@ -1528,9 +1527,7 @@ def fetch_page_with_retries(
             headers=response.headers,
             label=label,
         )  # Check the status code
-        validate_body(
-            response=response, response_body=page_body
-        )  # Check the content is what we expected
+        validate_body(response_body=page_body)  # Check the content is what we expected
         return final_url, page_body  # Hand the result back
 
     return run_with_retries(
@@ -1550,13 +1547,9 @@ def wait_for_site_recovery(
         if state == SITE_OK:  # All good
             return  # Resume
         if state == SITE_LOGGED_OUT:  # The session is gone
-            try:  # The log-in can hit a browser problem
-                ensure_login(browser_context=browser_context)  # Ask the user to log in
-            except PlaywrightError as error:  # The browser failed
-                logger.warning(
-                    msg=f"Log-in after the pause failed: {error}"
-                )  # Tell the user
-            return  # Resume
+            raise BrowserLostError(
+                "logged out during the pause"
+            )  # Close the browser and start over with an automatic log-in
         wait_seconds = min(
             MAXIMUM_PAGING_BACKOFF_SECONDS, wait_seconds * 2
         )  # The site is still down: wait longer
@@ -1608,10 +1601,6 @@ def describe_downloaded_file(
             raise_for_non_pdf(
                 response_body=body, description="saved by Chrome"
             )  # Always raises
-        if size < MINIMUM_PDF_BYTES:  # Absurdly small
-            raise RetryableFetchError(
-                f"the PDF is only {size} bytes (probably cut off)"
-            )  # Treat as a glitch
         saved_file.seek(
             max(0, size - PDF_END_SEARCH_BYTES)
         )  # Jump near the end of the file
@@ -1686,9 +1675,30 @@ def fetch_pdf_with_retries(
             msg=f"{attempt_label}: Chrome is downloading {url}"
         )  # Log the address
         started_at = time.monotonic()  # Remember when the download started
-        download = let_chrome_download(
-            work_page=work_page, url=url, label=label
-        )  # Let Chrome download the file
+        try:  # Chrome reports "canceled" for 403, 404 and 500 alike
+            download = let_chrome_download(
+                work_page=work_page, url=url, label=label
+            )  # Let Chrome download the file
+        except (
+            RefusedDownloadError
+        ):  # Is this a real refusal, or a side effect of something else?
+            raise_if_browser_closed()  # A dead browser is not a refusal
+            site_state = check_site_state(
+                browser_context=browser_context
+            )  # Is the site up and are we logged in?
+            if (
+                site_state == SITE_LOGGED_OUT
+            ):  # The session ended, so the file was not really refused
+                raise SessionExpiredError(
+                    f"{label}: the download was canceled because the session ended"
+                )  # Log in again and retry
+            if (
+                site_state == SITE_DOWN
+            ):  # The site is not answering, so the file was not really refused
+                raise RetryableFetchError(
+                    f"{label}: the download was canceled while the site was down"
+                )  # Retry later
+            raise  # The site is fine, so the file really is refused
         download.save_as(
             path=str(partial_path)
         )  # Copy Chrome's temporary download to our temporary file
@@ -1728,12 +1738,43 @@ def handle_alert_dialog(
         )  # Log and carry on
 
 
+def clear_chrome_restore_state() -> (
+    None
+):  # Make Chrome believe it closed cleanly and forget the old tabs, so it never restores them
+    default_folder = (
+        BROWSER_PROFILE_FOLDER / "Default"
+    )  # The folder of Chrome's default profile
+    shutil.rmtree(
+        default_folder / "Sessions", ignore_errors=True
+    )  # Delete the saved tabs of the last session
+    preferences_file = default_folder / "Preferences"  # Chrome's settings file
+    try:  # Reading and writing the file can fail
+        if not preferences_file.exists():  # First start: there is nothing to fix
+            return  # Done
+        preferences = json.loads(
+            preferences_file.read_text(encoding="utf-8")
+        )  # Read the settings
+        profile_settings = preferences.setdefault(
+            "profile", {}
+        )  # The profile section of the settings
+        profile_settings["exit_type"] = "Normal"  # Pretend the last exit was normal
+        profile_settings["exited_cleanly"] = True  # Pretend the last exit was clean
+        preferences_file.write_text(
+            json.dumps(preferences), encoding="utf-8"
+        )  # Save the settings
+    except (OSError, ValueError) as error:  # The file is unreadable or not valid JSON
+        logger.warning(
+            msg=f"Could not reset Chrome's restore state: {error}"
+        )  # Carry on without it
+
+
 def open_browser_context(
     *, playwright_instance: Playwright
 ) -> BrowserContext:  # Launch and configure the browser
     BROWSER_PROFILE_FOLDER.mkdir(
         parents=True, exist_ok=True
     )  # Create the browser profile folder
+    clear_chrome_restore_state()  # Chrome must not offer to restore tabs from a crashed session
     try:  # The browser may not be installed
         browser_context = playwright_instance.chromium.launch_persistent_context(
             user_data_dir=str(
@@ -1749,7 +1790,17 @@ def open_browser_context(
         raise RuntimeError(
             f"Could not start Chromium ({error}). Try: playwright install --with-deps chromium"
         ) from error  # The main loop retries later
+    for restored_page in browser_context.pages[
+        1:
+    ]:  # Every tab except the first (these could only be restored tabs)
+        try:  # Closing can fail
+            restored_page.close()  # Close the restored tab
+        except PlaywrightError:  # The tab is already gone
+            pass  # Nothing more to do
     totals.browser_closed = False  # A fresh browser is running
+    browser_context.add_init_script(
+        script=KEEP_ALIVE_JAVASCRIPT
+    )  # Every page of the site keeps the session alive (never clicks Logout)
     browser_context.on(
         event="close", f=mark_browser_closed
     )  # Find out the moment Chrome dies
@@ -1815,33 +1866,29 @@ def wait_for_enter(
         take_typed_line()
     ):  # Throw away Enter presses that happened before this prompt
         pass  # Keep clearing
-    totals.waiting_for_user = True  # Tell the heartbeat to stay quiet
     print(message, flush=True)  # Show the prompt
-    notify_user(text=message.strip())  # Ring the bell and call the optional webhook
+    notify_user()  # Ring the terminal bell
     last_reminder_at = time.monotonic()  # When the prompt was last shown
-    try:  # The flag must always be reset
-        while True:  # Wait for Enter
-            if take_typed_line():  # Enter was pressed
-                return  # Leave the function
-            if stdin_state[
-                "closed"
-            ]:  # The terminal input has ended, so nobody can press Enter
-                logger.warning(
-                    msg=f"Terminal input is closed; continuing automatically in {CLOSED_INPUT_WAIT_SECONDS}s"
-                )  # Explain
-                time.sleep(CLOSED_INPUT_WAIT_SECONDS)  # Give the browser some time
-                return  # Continue as if Enter was pressed
-            if (
-                time.monotonic() - last_reminder_at >= PROMPT_REPEAT_SECONDS
-            ):  # Nobody answered for a while
-                print(
-                    f"\n(still waiting for you){message}", flush=True
-                )  # Show the prompt again
-                notify_user(text=message.strip())  # Signal again
-                last_reminder_at = time.monotonic()  # Restart the reminder timer
-            pump_browser(browser_page=browser_page)  # Let Playwright process events
-    finally:  # Always runs
-        totals.waiting_for_user = False  # The prompt is over
+    while True:  # Wait for Enter
+        if take_typed_line():  # Enter was pressed
+            return  # Leave the function
+        if stdin_state[
+            "closed"
+        ]:  # The terminal input has ended, so nobody can press Enter
+            logger.warning(
+                msg=f"Terminal input is closed; continuing automatically in {CLOSED_INPUT_WAIT_SECONDS}s"
+            )  # Explain
+            time.sleep(CLOSED_INPUT_WAIT_SECONDS)  # Give the browser some time
+            return  # Continue as if Enter was pressed
+        if (
+            time.monotonic() - last_reminder_at >= PROMPT_REPEAT_SECONDS
+        ):  # Nobody answered for a while
+            print(
+                f"\n(still waiting for you){message}", flush=True
+            )  # Show the prompt again
+            notify_user()  # Ring the terminal bell again
+            last_reminder_at = time.monotonic()  # Restart the reminder timer
+        pump_browser(browser_page=browser_page)  # Let Playwright process events
 
 
 # ===========================================================================
@@ -2061,7 +2108,9 @@ def read_first_ident(
 
 def go_to_next_results_page(
     *, browser_page: Page, next_page_number: int
-) -> None:  # Click next and wait until the label AND the grid changed (never gives up)
+) -> (
+    None
+):  # Click next and wait until the label AND the grid changed (stops the run after PAGING_MAXIMUM_ROUNDS failed rounds)
     previous_ident = read_first_ident(
         browser_page=browser_page
     )  # First document of the old page, to prove the grid was replaced
@@ -2072,6 +2121,7 @@ def go_to_next_results_page(
             raise BrowserLostError(
                 "the results tab was closed"
             )  # The main loop restarts the session
+        raise_if_browser_closed()  # Chrome died
         for attempt_number in range(1, RETRY_ATTEMPTS + 1):  # Several tries per round
             try:  # Clicking or waiting can time out
                 browser_page.click(
@@ -2098,39 +2148,68 @@ def go_to_next_results_page(
                 time.sleep(
                     SECONDS_PER_RETRY_STEP * attempt_number
                 )  # Short pause before the next try
+        if (
+            round_number >= PAGING_MAXIMUM_ROUNDS
+        ):  # Enough rounds, this will not fix itself
+            reason = f"paging to results page {next_page_number} failed in {round_number} rounds (did the site layout change?)"  # What went wrong
+            record_failure(
+                document_label=f"paging to results page {next_page_number}",
+                url=SEARCH_PAGE_URL,
+                reason=reason,
+            )  # Remember it for the final summary
+            raise PagingFailedError(reason)  # Stop the run with a clear error
         wait_seconds = min(
             MAXIMUM_PAGING_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
         )  # Longer pauses between rounds
         logger.error(
-            msg=f"Paging to results page {next_page_number} keeps failing; trying again in {wait_seconds}s (Ctrl+C is the only way to stop)"
+            msg=f"Paging to results page {next_page_number} keeps failing (round {round_number}/{PAGING_MAXIMUM_ROUNDS}); trying again in {wait_seconds}s"
         )  # Explain
         time.sleep(wait_seconds)  # Wait before the next round
 
 
 def read_grid_records(
     *, grid_page: Page, page_number: int
-) -> list[DocumentRecord]:  # Read the documents of the current results page
-    for attempt_number in range(1, RETRY_ATTEMPTS + 1):  # Several tries
-        try:  # Reading and parsing can fail
-            grid_html = grid_page.locator(selector=RESULTS_GRID_SELECTOR).evaluate(
-                expression=GET_OUTER_HTML_JAVASCRIPT
-            )  # The HTML of the grid
-            return parse_results_grid(html_text=grid_html)  # Parse it into records
-        except (
-            PlaywrightError,
-            etree.LxmlError,
-            ValueError,
-        ) as error:  # Browser or parsing problem
-            logger.warning(
-                msg=f"Reading results page {page_number} failed (try {attempt_number}/{RETRY_ATTEMPTS}): {error}"
-            )  # Log it
-            time.sleep(
-                SECONDS_PER_RETRY_STEP * attempt_number
-            )  # Wait before trying again
-    logger.error(
-        msg=f"Results page {page_number} could not be read; skipping to the next page"
-    )  # Every attempt failed
-    return []  # Continue with an empty page instead of stopping
+) -> list[
+    DocumentRecord
+]:  # Read the documents of the current results page (a failed read is never returned as an empty page)
+    for round_number in range(1, PAGING_MAXIMUM_ROUNDS + 1):  # Several rounds
+        for attempt_number in range(1, RETRY_ATTEMPTS + 1):  # Several tries per round
+            if grid_page.is_closed():  # The results tab was closed
+                raise BrowserLostError(
+                    "the results tab was closed"
+                )  # The main loop restarts the session
+            raise_if_browser_closed()  # Chrome died
+            try:  # Reading and parsing can fail
+                grid_html = grid_page.locator(selector=RESULTS_GRID_SELECTOR).evaluate(
+                    expression=GET_OUTER_HTML_JAVASCRIPT
+                )  # The HTML of the grid
+                return parse_results_grid(html_text=grid_html)  # Parse it into records
+            except (
+                PlaywrightError,
+                etree.LxmlError,
+                ValueError,
+            ) as error:  # Browser or parsing problem
+                logger.warning(
+                    msg=f"Reading results page {page_number} failed (round {round_number}, try {attempt_number}/{RETRY_ATTEMPTS}): {error}"
+                )  # Log it
+                time.sleep(
+                    SECONDS_PER_RETRY_STEP * attempt_number
+                )  # Wait before trying again
+        if round_number < PAGING_MAXIMUM_ROUNDS:  # Another round follows
+            wait_seconds = min(
+                MAXIMUM_PAGING_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
+            )  # Longer pauses between rounds
+            logger.error(
+                msg=f"Results page {page_number} could not be read; trying again in {wait_seconds}s"
+            )  # Explain
+            time.sleep(wait_seconds)  # Wait before the next round
+    reason = f"results page {page_number} could not be read in {PAGING_MAXIMUM_ROUNDS} rounds"  # What went wrong
+    record_failure(
+        document_label=f"results page {page_number}", url=SEARCH_PAGE_URL, reason=reason
+    )  # Remember it for the final summary
+    raise PagingFailedError(
+        reason
+    )  # Stop the run with a clear error instead of skipping the page
 
 
 def iterate_results_pages(
@@ -2156,6 +2235,33 @@ def iterate_results_pages(
     logger.info(
         msg=f"Starting at results page {current_page_number} of {total_page_count}"
     )  # Log where we start
+    resume_page_number = load_resume_page()  # The page where the last run stopped
+    if resume_page_number is not None:  # An earlier run saved a page
+        if (
+            current_page_number < resume_page_number <= total_page_count
+        ):  # The saved page can be reached by paging forward
+            logger.info(
+                msg=f"Resuming at results page {resume_page_number} (saved by an earlier run), paging forward from page {current_page_number}"
+            )  # Tell the user
+            while (
+                current_page_number < resume_page_number
+            ):  # Until the saved page is reached
+                go_to_next_results_page(
+                    browser_page=grid_page, next_page_number=current_page_number + 1
+                )  # Click Next without reading any documents
+                current_page_number += 1  # Count the page
+                if current_page_number % PAGES_BETWEEN_SKIP_LOGS == 0:  # Now and then
+                    logger.info(
+                        msg=f"Paging forward: results page {current_page_number} of {total_page_count}"
+                    )  # Show the progress
+                polite_pause()  # Wait briefly to be polite to the server
+        elif (
+            resume_page_number > total_page_count
+        ):  # The saved page does not exist any more
+            logger.warning(
+                msg=f"The saved results page {resume_page_number} is beyond the last page ({total_page_count}), starting at page {current_page_number}"
+            )  # Explain
+            clear_resume_page()  # Forget the useless page
     while True:  # Over all pages
         page_records = read_grid_records(
             grid_page=grid_page, page_number=current_page_number
@@ -2311,6 +2417,29 @@ def existing_file_is_valid(
         return False  # Treat it as broken
 
 
+def find_files_by_number(
+    *, document_folder: Path, pdf_link: PdfLink
+) -> list[
+    Path
+]:  # Find saved files of this file number even if the rest of the name differs
+    number_part = make_safe_name_part(
+        text=pdf_link["dmxid"],
+        maximum_length=FILE_NUMBER_MAXIMUM_LENGTH,
+        fallback=FALLBACK_FILE_NUMBER,
+    )  # The file number as it is written in file names
+    try:  # The folder may not exist or be unreadable
+        return sorted(
+            [
+                *document_folder.glob(f"*_{number_part}{PDF_FILE_EXTENSION}"),
+                *document_folder.glob(
+                    f"*_{number_part}{SUSPECT_MARKER}{PDF_FILE_EXTENSION}"
+                ),
+            ]
+        )  # Complete and incomplete-looking files with this number
+    except OSError:  # The folder cannot be read
+        return []  # Nothing found
+
+
 def should_skip_existing_file(
     *,
     document_record: DocumentRecord,
@@ -2326,7 +2455,8 @@ def should_skip_existing_file(
         recorded_path,
         target_path,
         suspect_path,
-    ):  # The recorded path first, then the expected names
+        *find_files_by_number(document_folder=target_path.parent, pdf_link=pdf_link),
+    ):  # The recorded path, the expected names, then any file in the folder with this file number (works without a database)
         if candidate_path is None or not candidate_path.exists():  # Nothing there
             continue  # Try the next candidate
         if not existing_file_is_valid(target_path=candidate_path):  # The file is broken
@@ -2334,6 +2464,13 @@ def should_skip_existing_file(
                 msg=f"{file_label}: the existing file {candidate_path.name} looks broken, downloading it again"
             )  # Explain
             continue  # Try the next candidate
+        if SUSPECT_MARKER in candidate_path.name and not suspect_already_retried(
+            ident=document_record["ident"], dmxid=pdf_link["dmxid"]
+        ):  # An incomplete-looking file that was never downloaded a second time
+            logger.info(
+                msg=f"{file_label}: {candidate_path.name} looks incomplete, downloading it once more"
+            )  # Explain
+            continue  # Do not skip it
         logger.info(
             msg=f"{file_label}: already downloaded ({candidate_path.name}), skipping"
         )  # Log the skip
@@ -2383,6 +2520,16 @@ def register_saved_pdf(
         logger.warning(
             msg=f"{file_label}: no %%EOF end marker, the file may be incomplete; saved as {final_path.name}"
         )  # Warn
+        record_suspect_check(
+            document_record=document_record, pdf_link=pdf_link
+        )  # It was downloaded now, so later runs do not download it again
+    else:  # The file looks complete
+        clear_suspect_check(
+            document_record=document_record, pdf_link=pdf_link
+        )  # No second-download mark is needed any more
+        unlink_quietly(
+            file_path=suspect_path_for(target_path=final_path)
+        )  # Remove an older incomplete-looking copy
     logger.info(
         msg=f"{file_label}: SAVED -> {final_path} ({download.size} bytes, sha256 {download.sha256[:12]})"
     )  # Log the success
@@ -2540,10 +2687,12 @@ def download_one_document(
     browser_context: BrowserContext,
     document_record: DocumentRecord,
     document_label: str,
+    count_document: bool,
 ) -> (
     bool
 ):  # Check one ID: read its page, download only the files not saved yet; True if all worked
-    totals.documents += 1  # Count this document
+    if count_document:  # Retries of a failed document are not counted again
+        totals.documents += 1  # Count this document
     loaded = load_pdf_links(
         browser_context=browser_context,
         document_record=document_record,
@@ -2596,18 +2745,19 @@ def process_document(
     browser_context: BrowserContext,
     document_record: DocumentRecord,
     document_label: str,
-    page_number: int,
     log_suffix: str,
 ) -> bool:  # Check one document and sort it into "done" or "still failing"
     ident = document_record["ident"]  # Internal document ID
     log_label = (
         document_label + log_suffix
     )  # The label shown in the log (the stored label never gets suffixes)
+    is_retry = bool(log_suffix)  # A retry has a suffix
     try:  # NO error may escape from a single document
         document_ok = download_one_document(
             browser_context=browser_context,
             document_record=document_record,
             document_label=log_label,
+            count_document=not is_retry,
         )  # Check the document
     except BrowserLostError:  # Chrome is gone
         raise  # Let the main loop restart the session (this is not a problem of this document)
@@ -2623,9 +2773,15 @@ def process_document(
             del totals.failed_documents[ident]  # It is not a problem any more
             totals.recovered += 1  # Count the recovery
     else:  # Something went wrong
+        previous_failure = totals.failed_documents.get(
+            ident
+        )  # Earlier failure of the same document
+        attempts = (
+            previous_failure.attempts + 1 if previous_failure is not None else 1
+        )  # How often it failed now
         totals.failed_documents[ident] = FailedDocument(
-            record=document_record, label=document_label, page_number=page_number
-        )  # Remember it for the retry round
+            record=document_record, label=document_label, attempts=attempts
+        )  # Remember it for the next retry round
     circuit_breaker(
         browser_context=browser_context, document_ok=document_ok
     )  # Pause if too many documents fail in a row
@@ -2633,28 +2789,34 @@ def process_document(
 
 
 def retry_failed_documents(
-    *, browser_context: BrowserContext
-) -> None:  # Give failed documents another chance after the main run
-    for round_number in range(1, FINAL_RETRY_ROUNDS + 1):  # A few rounds
-        if not totals.failed_documents:  # Nothing left to retry
+    *, browser_context: BrowserContext, rounds: int, final: bool
+) -> (
+    None
+):  # Give failed documents another chance (every few pages, and once more at the end)
+    for round_number in range(1, rounds + 1):  # A few rounds
+        waiting_documents = [
+            failed_document
+            for failed_document in totals.failed_documents.values()
+            if final or failed_document.attempts < MAXIMUM_DOCUMENT_ATTEMPTS
+        ]  # During the run, documents that failed too often are left for the final round
+        if not waiting_documents:  # Nothing left to retry
             return  # Done
         logger.info(
-            msg=f"=== Retry round {round_number}/{FINAL_RETRY_ROUNDS}: {len(totals.failed_documents)} documents ==="
+            msg=f"=== Retry round {round_number}/{rounds}: {len(waiting_documents)} documents ==="
         )  # Announce the round
-        for failed_document in list(
-            totals.failed_documents.values()
-        ):  # Work on a copy because the dictionary changes
+        for (
+            failed_document
+        ) in waiting_documents:  # Work on a copy because the dictionary changes
             process_document(
                 browser_context=browser_context,
                 document_record=failed_document.record,
                 document_label=failed_document.label,
-                page_number=failed_document.page_number,
                 log_suffix=f" (retry {round_number})",
             )  # Try again (the suffix is only for logging)
             polite_pause()  # Wait briefly between documents
-    if totals.failed_documents:  # Some documents still fail
+    if final and totals.failed_documents:  # Some documents still fail at the very end
         logger.warning(
-            msg=f"{len(totals.failed_documents)} documents still fail after {FINAL_RETRY_ROUNDS} retry rounds"
+            msg=f"{len(totals.failed_documents)} documents still fail after {rounds} retry rounds"
         )  # Say so
 
 
@@ -2686,7 +2848,6 @@ def process_results_page(
             browser_context=browser_context,
             document_record=document_record,
             document_label=document_label,
-            page_number=page_number,
             log_suffix="",
         )  # Check it (errors are handled inside)
         processed_count += 1  # Count it
@@ -2710,6 +2871,9 @@ def download_all_documents(
         logger.info(
             msg=f"=== Results page {page_number}/{total_page_count}: {len(page_records)} documents ==="
         )  # Log the page
+        save_resume_page(
+            page_number=page_number, total_pages=total_page_count
+        )  # Remember this page, so a restart or crash continues here
         process_results_page(
             browser_context=browser_context,
             grid_page=grid_page,
@@ -2717,9 +2881,17 @@ def download_all_documents(
             page_records=page_records,
             seen_idents=seen_idents,
         )  # Download its documents
+        if (
+            page_number % RETRY_FAILED_EVERY_N_PAGES == 0
+        ):  # Time to retry what failed on earlier pages
+            retry_failed_documents(
+                browser_context=browser_context, rounds=1, final=False
+            )  # Retry now instead of waiting for the very end
     retry_failed_documents(
-        browser_context=browser_context
+        browser_context=browser_context, rounds=FINAL_RETRY_ROUNDS, final=True
     )  # Give every failed document another chance
+    clear_resume_page()  # The whole search was finished, so the next run starts at page 1 again
+    logger.info(msg="Finished all results pages")  # Tell the user
 
 
 # ===========================================================================
@@ -2753,6 +2925,24 @@ def run_until_finished() -> None:  # Keep starting browser sessions until one fi
                     playwright_instance=playwright_instance
                 )  # Run one session
         except (
+            PagingFailedError
+        ) as error:  # Paging or reading a results page failed for good
+            logger.error(
+                msg=f"STOPPING: {error}. Fix the problem, then run again; finished documents and files are skipped."
+            )  # Say clearly why the run ends
+            notify_user()  # Ring the terminal bell
+            totals.stopped_early = True  # Remember it for the exit code
+            return  # End the run (a restart would not help)
+        except BrowserLostError as error:  # Chrome died or the session ended
+            totals.restarts += 1  # Count the restart
+            wait_seconds = min(
+                MAXIMUM_RESTART_WAIT_SECONDS, RESTART_WAIT_SECONDS * totals.restarts
+            )  # Wait longer after every restart
+            logger.warning(
+                msg=f"{error}: the browser was closed. Starting again with an automatic log-in in {wait_seconds}s (finished documents and files are skipped)"
+            )  # Explain
+            time.sleep(wait_seconds)  # Wait before the next session
+        except (
             Exception
         ):  # Any crash of the session (browser closed, Chromium missing, ...)
             totals.restarts += 1  # Count the restart
@@ -2771,7 +2961,6 @@ def main() -> int:  # The entry point; returns the exit code
     try:  # The only way to stop the script is Ctrl+C
         run_preflight_checks()  # Check terminal, write access and disk space
         log_database_overview()  # Tell what earlier runs already know
-        start_heartbeat_thread()  # Start the "still running" messages
         run_until_finished()  # Run until everything is done
     except KeyboardInterrupt:  # The user pressed Ctrl+C
         logger.warning(
@@ -2779,7 +2968,6 @@ def main() -> int:  # The entry point; returns the exit code
         )  # Log it
         exit_code = 130  # The conventional exit code for Ctrl+C
     finally:  # Runs before exiting
-        heartbeat_stop.set()  # Stop the heartbeat thread
         close_database()  # Close the local database
         log_totals()  # Print the final totals
         log_change_summary()  # List the new IDs and the new files of known IDs
@@ -2788,6 +2976,8 @@ def main() -> int:  # The entry point; returns the exit code
         log_failure_summary()  # List the problems
         if totals.failed_documents:  # Some documents still have problems
             exit_code = exit_code or 1  # Make sure the exit code reports them
+        if totals.stopped_early:  # The run stopped before the last results page
+            exit_code = exit_code or 1  # Make sure the exit code reports it
     return exit_code  # Hand the exit code back
 
 
