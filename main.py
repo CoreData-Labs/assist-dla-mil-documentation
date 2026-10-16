@@ -105,6 +105,23 @@ JITTER_MINIMUM_FACTOR = (
 )
 JITTER_MAXIMUM_FACTOR = 1.3  # ... and at most this
 SHOW_BROWSER_WINDOW = True  # True makes the browser visible to the user
+BROWSER_LAUNCH_ARGUMENTS = [
+    "--start-maximized"
+]  # Chrome opens maximized (full screen size), never minimized
+BROWSER_IGNORED_DEFAULT_ARGUMENTS = [
+    "--enable-automation",
+    "--password-store=basic",
+    "--use-mock-keychain",
+]  # Playwright flags that switch off Chrome's password manager, so saved passwords can be autofilled
+AUTO_LOGIN_WAIT_SECONDS = (
+    15  # How long to wait for Chrome to autofill the saved username and password
+)
+AUTO_STEP_TIMEOUT_MS = (
+    30_000  # Timeout in milliseconds for each automatic click or wait
+)
+AUTO_OPTIONAL_CLICK_TIMEOUT_MS = (
+    5_000  # Timeout for the optional "Search Method" and "Advanced Search" clicks
+)
 MINIMUM_FREE_DISK_BYTES = (
     500 * 1024 * 1024
 )  # Pause while less than 500 MB of disk space is free
@@ -127,15 +144,6 @@ MAXIMUM_RELOGINS_PER_REQUEST = (
 CIRCUIT_BREAKER_FAILURES = 5  # This many failed documents in a row pauses the run
 CIRCUIT_BREAKER_BASE_SECONDS = (
     30  # First breaker pause (doubles with every trip in a row)
-)
-NO_PDF_STREAK_BEFORE_ALERT = (
-    25  # This many documents in a row without PDF links pauses the run
-)
-NO_PDF_STREAK_GROWTH_FACTOR = (
-    4  # After you confirmed a streak, the next alert needs this many times more
-)
-EMPTY_PAGES_BEFORE_ALERT = (
-    2  # This many results pages in a row without documents pauses the run
 )
 PROMPT_REPEAT_SECONDS = (
     600  # A waiting prompt is shown (and signalled) again every 10 minutes
@@ -193,16 +201,35 @@ NO_RESULTS_REMINDER = (  # Shown when the results grid is missing
     "   wait for the results to appear, then press Enter here..."  # Prompt
 )  # End of the reminder
 LOGIN_TAB_MESSAGE = "\n>> Log in in the new browser tab, then press Enter here..."  # Shown when a new log-in is needed
-LAYOUT_CHECK_MESSAGE = (  # Shown when the website may have changed its layout
-    "\n>> Possible website layout change: {problem}\n"  # Describe the suspicion
-    "   Look at the browser window. If everything is fine, press Enter here to continue..."  # Prompt
-)  # End of the message
 
 # ===========================================================================
 # WEBSITE DETAILS
 # ===========================================================================
 BASE_URL = "https://assist.dla.mil"  # Base URL of the website
 START_PAGE_URL = BASE_URL + "/online/start/"  # Log-in / start page
+SEARCH_PAGE_URL = (
+    BASE_URL + "/AssistNet/Analyse/FilteredSearchA.aspx"
+)  # Page that is opened after the log-in to run the search
+PASSWORD_FIELD_SELECTOR = (
+    "input[type='password']"  # The password field of a log-in form
+)
+PASSWORD_AUTOFILLED_SELECTOR = (
+    PASSWORD_FIELD_SELECTOR + ":-webkit-autofill"
+)  # A password field that Chrome has autofilled
+LOGIN_DONE_JAVASCRIPT = (  # True when the log-in form is gone or a logout link is present
+    "() => document.querySelector(\"input[type='password']\") === null"  # No password field any more
+    " || document.documentElement.innerHTML.toLowerCase().includes('logout')"  # Or a logout link exists
+)  # End of the script
+SEARCH_METHOD_PATTERN = re.compile(
+    pattern=r"search\s*method", flags=re.IGNORECASE
+)  # Text of the "Search Method" control
+ADVANCED_SEARCH_PATTERN = re.compile(
+    pattern=r"advanced\s*search", flags=re.IGNORECASE
+)  # Text of the "Advanced Search" control
+SEARCH_BUTTON_PATTERN = re.compile(
+    pattern=r"^\s*search\s*$", flags=re.IGNORECASE
+)  # Name of the Search button
+SEARCH_BUTTON_FALLBACK_SELECTOR = "input[type='submit'][value='Search' i], input[type='button'][value='Search' i], button:text-is('Search')"  # Backup way to find the Search button
 DETAIL_PAGE_URL_TEMPLATE = (
     BASE_URL + "/online/doc_analysis/doc_info_general.cfm?ident_number={}"
 )  # Document page URL
@@ -367,13 +394,6 @@ class Totals:  # Running counters and shared state
     restarts: int = 0  # Browser session restarts
     consecutive_failures: int = 0  # Failed documents in a row (circuit breaker)
     breaker_trips: int = 0  # Breaker trips in a row (grows the pause)
-    consecutive_no_pdfs: int = 0  # Documents without PDF links in a row (layout check)
-    no_pdf_threshold: int = (
-        NO_PDF_STREAK_BEFORE_ALERT  # Streak length that triggers the next layout alert
-    )
-    consecutive_empty_pages: int = (
-        0  # Results pages without documents in a row (layout check)
-    )
     work_page: Page | None = (
         None  # The dedicated Chrome tab for document pages and downloads
     )
@@ -1695,9 +1715,14 @@ def open_browser_context(
     )  # Create the browser profile folder
     try:  # The browser may not be installed
         browser_context = playwright_instance.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_PROFILE_FOLDER),
-            headless=not SHOW_BROWSER_WINDOW,
-            accept_downloads=True,
+            user_data_dir=str(
+                BROWSER_PROFILE_FOLDER
+            ),  # Where the persistent profile lives
+            headless=not SHOW_BROWSER_WINDOW,  # Visible window unless switched off
+            accept_downloads=True,  # Allow Chrome to download files
+            no_viewport=True,  # No fixed 1280x720 viewport, so pages follow the window size and the window can be resized
+            args=BROWSER_LAUNCH_ARGUMENTS,  # Start the window maximized
+            ignore_default_args=BROWSER_IGNORED_DEFAULT_ARGUMENTS,  # Keep Chrome's password manager (autofill) switched on
         )  # Launch the persistent browser
     except PlaywrightError as error:  # Chromium could not start
         raise RuntimeError(
@@ -1811,9 +1836,127 @@ def find_results_page(
     return None  # No tab shows the results grid
 
 
+def password_field_is_filled(
+    *, browser_page: Page
+) -> bool:  # Did Chrome autofill the saved password into the log-in form?
+    try:  # The page may be busy or closed
+        return (
+            browser_page.locator(selector=PASSWORD_AUTOFILLED_SELECTOR).count() > 0
+        )  # Chrome marks autofilled fields (it hides their value from scripts until a click)
+    except PlaywrightError:  # The page cannot be inspected
+        return False  # Treat it as "not filled"
+
+
+def try_auto_login(
+    *, browser_page: Page
+) -> (
+    bool
+):  # Log in with the password saved in Chrome; True if we are (probably) logged in
+    if page_shows_logout_link(page=browser_page):  # Already logged in
+        logger.info(msg="Already logged in")  # Tell the user
+        return True  # Nothing more to do
+    try:  # Counting elements can fail
+        has_login_form = (
+            browser_page.locator(selector=PASSWORD_FIELD_SELECTOR).count() > 0
+        )  # Is there a password field on the page?
+    except PlaywrightError:  # The page cannot be inspected
+        has_login_form = False  # Treat it as "no form"
+    if not has_login_form:  # No log-in form is shown
+        logger.info(
+            msg="No log-in form is shown, assuming we are already logged in"
+        )  # Tell the user
+        return True  # The search step will show whether this is true
+    deadline = (
+        time.monotonic() + AUTO_LOGIN_WAIT_SECONDS
+    )  # Moment to stop waiting for the autofill
+    while not password_field_is_filled(
+        browser_page=browser_page
+    ):  # Wait for Chrome to fill the form
+        if time.monotonic() >= deadline:  # Chrome did not fill anything in time
+            logger.warning(
+                msg="Chrome did not autofill a saved password (log in once in this browser and let Chrome save the password)"
+            )  # Explain
+            return False  # Fall back to the manual log-in
+        pump_browser(browser_page=browser_page)  # Let Playwright process events
+    logger.info(msg="Chrome filled in the saved log-in, submitting it")  # Tell the user
+    try:  # Clicking and waiting can fail
+        browser_page.click(
+            selector=PASSWORD_FIELD_SELECTOR, timeout=AUTO_STEP_TIMEOUT_MS
+        )  # A real click lets Chrome release the autofilled password to the page
+        browser_page.press(
+            selector=PASSWORD_FIELD_SELECTOR, key="Enter", timeout=AUTO_STEP_TIMEOUT_MS
+        )  # Press Enter to submit the form
+        browser_page.wait_for_function(
+            expression=LOGIN_DONE_JAVASCRIPT, timeout=AUTO_STEP_TIMEOUT_MS
+        )  # Wait until the log-in form is gone
+    except PlaywrightError as error:  # Click, key press or wait failed
+        logger.warning(msg=f"Automatic log-in failed: {error}")  # Explain
+        return False  # Fall back to the manual log-in
+    logger.info(msg="Automatic log-in OK")  # Tell the user
+    return True  # Logged in
+
+
+def run_advanced_search(
+    *, browser_context: BrowserContext, browser_page: Page
+) -> (
+    Page | None
+):  # Open the search page, choose Advanced Search, click Search; the results tab or None
+    try:  # The page may not load
+        browser_page.goto(
+            url=SEARCH_PAGE_URL,
+            wait_until="domcontentloaded",
+            timeout=REQUEST_TIMEOUT_MS,
+        )  # Open the search page
+    except PlaywrightError as error:  # The page did not load
+        logger.warning(msg=f"Could not open the search page: {error}")  # Explain
+        return None  # Fall back to the manual steps
+    for step_pattern in (
+        SEARCH_METHOD_PATTERN,
+        ADVANCED_SEARCH_PATTERN,
+    ):  # The two optional clicks (the page may already be the advanced search)
+        try:  # The control may not exist
+            browser_page.get_by_text(step_pattern).first.click(
+                timeout=AUTO_OPTIONAL_CLICK_TIMEOUT_MS
+            )  # Click the control with this text
+            logger.info(msg=f"Clicked '{step_pattern.pattern}'")  # Tell the user
+        except PlaywrightError:  # The control was not found or not clickable
+            logger.info(
+                msg=f"'{step_pattern.pattern}' not found, continuing"
+            )  # Not an error: the page may already show it
+    try:  # The Search button may not be found by its role
+        browser_page.get_by_role("button", name=SEARCH_BUTTON_PATTERN).first.click(
+            timeout=AUTO_STEP_TIMEOUT_MS
+        )  # Click the Search button
+    except PlaywrightError:  # Not found that way
+        try:  # Try the backup selector
+            browser_page.locator(selector=SEARCH_BUTTON_FALLBACK_SELECTOR).first.click(
+                timeout=AUTO_STEP_TIMEOUT_MS
+            )  # Click the Search button
+        except PlaywrightError as error:  # Not found at all
+            logger.warning(msg=f"Could not click Search: {error}")  # Explain
+            return None  # Fall back to the manual steps
+    logger.info(msg="Clicked Search, waiting for the results grid")  # Tell the user
+    deadline = (
+        time.monotonic() + REQUEST_TIMEOUT_MS / 1000
+    )  # Moment to stop waiting for the grid
+    while time.monotonic() < deadline:  # Until the grid shows up
+        results_page = find_results_page(
+            browser_context=browser_context
+        )  # Look for the grid on every tab
+        if results_page is not None:  # Found it
+            return results_page  # Hand the results tab back
+        pump_browser(browser_page=browser_page)  # Let Playwright process events
+    logger.warning(
+        msg="The results grid did not appear after clicking Search"
+    )  # Explain
+    return None  # Fall back to the manual steps
+
+
 def open_results_grid(
     *, browser_context: BrowserContext
-) -> Page:  # Wait for the user to reach the search results (no extra requests)
+) -> (
+    Page
+):  # Log in and search automatically; fall back to asking the user if that fails
     browser_page = get_working_page(browser_context=browser_context)  # The first tab
     try:  # The start page may not load
         browser_page.goto(
@@ -1821,7 +1964,23 @@ def open_results_grid(
         )  # Go to the start page
     except PlaywrightError as error:  # The page did not load
         logger.warning(msg=f"Could not open the start page: {error}")  # Tell the user
-    message = START_INSTRUCTIONS  # The first prompt
+    if try_auto_login(
+        browser_page=browser_page
+    ):  # Logged in without help from the user
+        results_page = run_advanced_search(
+            browser_context=browser_context, browser_page=browser_page
+        )  # Search automatically
+        if results_page is not None:  # The results grid is showing
+            logger.info(msg="Found the results grid")  # Log the success
+            return results_page  # Start scraping
+        logger.warning(
+            msg="Automatic search failed, switching to the manual steps"
+        )  # Explain
+    else:  # The automatic log-in did not work
+        logger.warning(
+            msg="Automatic log-in failed, switching to the manual steps"
+        )  # Explain
+    message = START_INSTRUCTIONS  # The first prompt (manual fallback)
     while True:  # Until the grid is found
         wait_for_enter(browser_page=browser_page, message=message)  # Wait for the user
         if (
@@ -1949,37 +2108,6 @@ def read_grid_records(
     return []  # Continue with an empty page instead of stopping
 
 
-def pause_for_layout_check(
-    *, browser_page: Page, problem: str
-) -> None:  # Stop and ask the user to look at the website
-    logger.error(msg=f"Possible website layout change: {problem}")  # Log the suspicion
-    wait_for_enter(
-        browser_page=browser_page, message=LAYOUT_CHECK_MESSAGE.format(problem=problem)
-    )  # Wait until the user confirmed
-
-
-def check_for_empty_pages(
-    *, grid_page: Page, page_number: int, page_records: list[DocumentRecord]
-) -> list[DocumentRecord]:  # Watch for several empty pages in a row
-    if page_records:  # The page has documents
-        totals.consecutive_empty_pages = 0  # The streak is over
-        return page_records  # Nothing to do
-    totals.consecutive_empty_pages += 1  # One more empty page in a row
-    logger.warning(
-        msg=f"Results page {page_number} contains no documents (the site layout may have changed)"
-    )  # Warn
-    if totals.consecutive_empty_pages < EMPTY_PAGES_BEFORE_ALERT:  # Not enough yet
-        return page_records  # Keep going
-    pause_for_layout_check(
-        browser_page=grid_page,
-        problem=f"{totals.consecutive_empty_pages} results pages in a row contain no documents",
-    )  # Stop and ask
-    totals.consecutive_empty_pages = 0  # Start counting again
-    return read_grid_records(
-        grid_page=grid_page, page_number=page_number
-    )  # Read the page again, the user may have fixed something
-
-
 def iterate_results_pages(
     *, grid_page: Page
 ) -> Iterator[
@@ -2007,11 +2135,10 @@ def iterate_results_pages(
         page_records = read_grid_records(
             grid_page=grid_page, page_number=current_page_number
         )  # The documents of this page
-        page_records = check_for_empty_pages(
-            grid_page=grid_page,
-            page_number=current_page_number,
-            page_records=page_records,
-        )  # Layout check
+        if not page_records:  # Nothing was found on this page
+            logger.warning(
+                msg=f"Results page {current_page_number} contains no documents"
+            )  # Just log it and carry on
         yield current_page_number, total_page_count, page_records  # Hand this page to the caller
         if current_page_number >= total_page_count:  # The last page was reached
             return  # End the generator
@@ -2406,15 +2533,13 @@ def download_one_document(
         note_new_document(document_record=document_record)  # Announce it
     if not pdf_links:  # The page lists no PDF files
         totals.no_pdfs += 1  # Count it
-        totals.consecutive_no_pdfs += 1  # One more document without PDFs in a row
         logger.warning(
             msg=f"{document_label}: no PDF links found on the document page"
-        )  # May be normal or a layout change
+        )  # Log it
         record_document_check(
             document_record=document_record, pdf_count=0
         )  # Remember that it was checked
         return True  # Not an error in itself
-    totals.consecutive_no_pdfs = 0  # The streak is over
     document_folder = PDF_FOLDER / build_folder_name(
         document_record=document_record
     )  # The folder of this document
@@ -2504,21 +2629,6 @@ def retry_failed_documents(
         )  # Say so
 
 
-def check_no_pdf_streak(
-    *, grid_page: Page
-) -> None:  # Pause when many documents in a row have no PDF links
-    if totals.consecutive_no_pdfs < totals.no_pdf_threshold:  # Not enough yet
-        return  # Keep going
-    pause_for_layout_check(
-        browser_page=grid_page,
-        problem=f"{totals.consecutive_no_pdfs} documents in a row have no PDF links",
-    )  # Stop and ask
-    totals.consecutive_no_pdfs = 0  # Start counting again
-    totals.no_pdf_threshold *= (
-        NO_PDF_STREAK_GROWTH_FACTOR  # You said it is fine, so be less nervous next time
-    )
-
-
 def process_results_page(
     *,
     browser_context: BrowserContext,
@@ -2550,7 +2660,6 @@ def process_results_page(
             page_number=page_number,
             log_suffix="",
         )  # Check it (errors are handled inside)
-        check_no_pdf_streak(grid_page=grid_page)  # Layout check
         processed_count += 1  # Count it
         if processed_count % PROGRESS_EVERY_N_DOCUMENTS == 0:  # A batch boundary
             log_totals()  # Print the totals
