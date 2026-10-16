@@ -392,6 +392,9 @@ class Totals:  # Running counters and shared state
     bytes_saved: int = 0  # Total PDF bytes written
     recovered: int = 0  # Documents that failed first but worked later
     restarts: int = 0  # Browser session restarts
+    browser_closed: bool = (
+        False  # True when Chrome died or was closed (then the session restarts)
+    )
     consecutive_failures: int = 0  # Failed documents in a row (circuit breaker)
     breaker_trips: int = 0  # Breaker trips in a row (grows the pause)
     work_page: Page | None = (
@@ -517,6 +520,19 @@ def make_delay_controller(
 slow_down, speed_up, read_delay = make_delay_controller(
     base_delay=SECONDS_BETWEEN_REQUESTS, maximum_delay=MAXIMUM_DELAY_SECONDS
 )  # The one delay controller
+
+
+def mark_browser_closed(
+    _closed_context: Any = None,
+) -> None:  # Called by Playwright when the browser or its window is gone
+    totals.browser_closed = True  # Remember it, so every loop can stop quickly
+
+
+def raise_if_browser_closed() -> None:  # Stop the current work when Chrome is gone
+    if totals.browser_closed:  # Chrome died or was closed
+        raise BrowserLostError(
+            "the browser was closed or crashed"
+        )  # The main loop restarts the session
 
 
 def polite_pause() -> None:  # Wait the current adaptive delay, with random jitter
@@ -1441,6 +1457,7 @@ def run_with_retries(
     attempt_number = 0  # Normal attempts made
     while attempt_number < RETRY_ATTEMPTS:  # Try up to RETRY_ATTEMPTS times
         attempt_number += 1  # Count this attempt
+        raise_if_browser_closed()  # Do not retry on a dead browser
         backoff_seconds = (
             SECONDS_PER_RETRY_STEP * attempt_number
         )  # Progressive backoff: 2s, 4s, 6s, ...
@@ -1484,6 +1501,9 @@ def run_with_retries(
             logger.warning(
                 msg=f"{label}: {last_problem}; waiting {backoff_seconds}s"
             )  # Tell the user
+            if "has been closed" in str(error):  # Playwright says the browser is gone
+                totals.browser_closed = True  # Remember it
+                raise_if_browser_closed()  # Stop retrying right now
         if attempt_number < RETRY_ATTEMPTS:  # Only wait if another attempt follows
             time.sleep(backoff_seconds)  # Wait before trying again
     raise PermanentFetchError(
@@ -1523,6 +1543,7 @@ def wait_for_site_recovery(
 ) -> None:  # Wait until the site is up and we are logged in
     while True:  # Until the site is healthy again
         time.sleep(wait_seconds)  # Pause
+        raise_if_browser_closed()  # A dead browser cannot recover by waiting
         state = check_site_state(
             browser_context=browser_context
         )  # Is the site up? Are we logged in?
@@ -1728,6 +1749,10 @@ def open_browser_context(
         raise RuntimeError(
             f"Could not start Chromium ({error}). Try: playwright install --with-deps chromium"
         ) from error  # The main loop retries later
+    totals.browser_closed = False  # A fresh browser is running
+    browser_context.on(
+        event="close", f=mark_browser_closed
+    )  # Find out the moment Chrome dies
     browser_context.on(
         event=DIALOG_EVENT_NAME, f=handle_alert_dialog
     )  # Accept dialogs automatically
@@ -2428,6 +2453,8 @@ def download_one_pdf(
         download.partial_path.replace(
             final_path
         )  # Rename the finished file in one atomic step
+    except BrowserLostError:  # Chrome is gone
+        raise  # Let the main loop restart the session (this is not a problem of this file)
     except RefusedDownloadError as error:  # The server refused to send the file
         record_refused_file(
             document_record=document_record, pdf_link=pdf_link, reason=str(error)
@@ -2582,6 +2609,8 @@ def process_document(
             document_record=document_record,
             document_label=log_label,
         )  # Check the document
+    except BrowserLostError:  # Chrome is gone
+        raise  # Let the main loop restart the session (this is not a problem of this document)
     except Exception as error:  # Anything can go wrong
         record_failure(
             document_label=log_label,
