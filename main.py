@@ -3,6 +3,7 @@
 # Every ID is checked again on every run (new PDFs can appear later); files that are already saved are never requested again.
 # Requires Python 3.13 or newer.
 
+import atexit  # Stop the background ping when the script ends
 import errno  # Recognise the "disk is full" operating system error
 import hashlib  # Fingerprint every saved PDF
 import json  # Webhook message
@@ -13,6 +14,7 @@ import random  # Jitter for the pauses between requests
 import re  # Text pattern matching
 import shutil  # Measure the free disk space
 import sqlite3  # Local database of everything seen and saved in earlier runs
+import subprocess  # Run the background ping
 import sys  # Standard input and output
 import threading  # Keyboard reader thread
 import time  # Pauses and timing
@@ -27,6 +29,10 @@ from pathlib import Path  # Cross-platform file paths
 from typing import Any, TypedDict  # Type hints
 from urllib.parse import parse_qs, urljoin, urlparse  # URL parsing
 
+try:  # psutil is optional (it is needed to stop Chrome when the internet goes down)
+    import psutil  # Find and stop the Chrome processes of this script
+except ImportError:  # psutil is not installed
+    psutil = None  # The network watchdog then cannot stop Chrome by itself
 from lxml import etree  # Catch lxml parsing errors precisely
 from lxml import html as lxml_html  # Fast HTML parsing
 from playwright.sync_api import (
@@ -138,6 +144,16 @@ MAXIMUM_PAGING_BACKOFF_SECONDS = (
 FINAL_RETRY_ROUNDS = (
     1  # Extra rounds spent on documents that failed (every retry costs requests)
 )
+PING_BACKUP_AFTER_SECONDS = 3  # When the first address has not replied for this long, the backup address is pinged too
+PING_SILENCE_SECONDS = 60  # No ping reply for this long means the internet is down (Chrome is then stopped)
+PING_RETRY_WAIT_SECONDS = (
+    60  # When ping gets no reply, wait this long and then restart ping
+)
+PING_FIRST_REPLY_WAIT_SECONDS = (
+    10  # After ping was (re)started, wait this long for the first reply
+)
+PING_CHECK_SECONDS = 2  # How often the background watchdog looks at the ping replies
+PING_RESTART_MIN_SECONDS = 5  # A ping process that exited (for example "network unreachable") is restarted at most this often
 KEEP_ALIVE_SECONDS = 240  # The browser requests a small page this often, so the session does not time out (also during long downloads)
 CIRCUIT_BREAKER_FAILURES = 5  # This many failed documents in a row pauses the run
 CIRCUIT_BREAKER_BASE_SECONDS = (
@@ -203,6 +219,13 @@ NO_RESULTS_REMINDER = (  # Shown when the results grid is missing
 # WEBSITE DETAILS
 # ===========================================================================
 BASE_URL = "https://assist.dla.mil"  # Base URL of the website
+PING_TARGETS = (
+    "1.1.1.1",
+    "8.8.8.8",
+)  # Addresses to ping in the background: the first is pinged on its own, the others (backup) only while the first gets no reply
+PING_REPLY_PATTERN = re.compile(
+    pattern=r"ttl=", flags=re.IGNORECASE
+)  # A ping reply line contains "ttl=" (Linux, macOS and Windows)
 START_PAGE_URL = BASE_URL + "/online/start/"  # Log-in / start page
 SEARCH_PAGE_URL = (
     BASE_URL + "/AssistNet/Analyse/FilteredSearchA.aspx"
@@ -402,6 +425,12 @@ class Totals:  # Running counters and shared state
     browser_closed: bool = (
         False  # True when Chrome died or was closed (then the session restarts)
     )
+    ping_watch_enabled: bool = (
+        False  # True while the watchdog may stop Chrome because ping gets no reply
+    )
+    network_down: bool = (
+        False  # True while the internet is down (then Chrome is stopped and restarted)
+    )
     stopped_early: bool = (
         False  # True when the run stopped because paging or reading a results page failed for good
     )
@@ -439,12 +468,36 @@ class Totals:  # Running counters and shared state
     )  # Known IDs that got new files: ident -> file numbers
 
 
+@dataclass(kw_only=True)  # Holds the ping processes and the time of the last reply
+class PingMonitor:  # State of the background ping
+    processes: dict[str, subprocess.Popen] = field(
+        default_factory=dict
+    )  # The running ping process of each address
+    spawned_at: dict[str, float] = field(
+        default_factory=dict
+    )  # When each ping process was started (monotonic clock)
+    reply_at: dict[str, float] = field(
+        default_factory=dict
+    )  # Moment of the last reply of each address (monotonic clock)
+    started_at: float = 0.0  # Moment the pings were last (re)started (monotonic clock)
+    lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )  # Protects the processes while they are started or stopped
+    outage_lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )  # Held while the watchdog stops Chrome and ping, so the main thread waits for it
+
+
 totals = Totals()  # The one shared state object
+ping_monitor = PingMonitor()  # The one background ping state object
 logger = logging.getLogger(
     name="assist"
 )  # The named logger (handlers are added in setup_logging)
 stdin_lines: queue.Queue[str] = queue.Queue()  # Every line typed in the terminal
 stdin_state = {"started": False, "closed": False}  # Keyboard thread state
+watchdog_stop = (
+    threading.Event()
+)  # Set at the end of the run to stop the network watchdog
 
 
 # ===========================================================================
@@ -479,6 +532,12 @@ class RefusedDownloadError(
 
 
 class BrowserLostError(Exception):  # The browser tab or window is gone
+    pass  # No custom logic needed
+
+
+class NetworkDownError(
+    BrowserLostError
+):  # The internet connection was lost (Chrome is stopped and restarted later)
     pass  # No custom logic needed
 
 
@@ -542,7 +601,13 @@ def mark_browser_closed(
     totals.browser_closed = True  # Remember it, so every loop can stop quickly
 
 
-def raise_if_browser_closed() -> None:  # Stop the current work when Chrome is gone
+def raise_if_browser_closed() -> (
+    None
+):  # Stop the current work when Chrome is gone or the internet is down
+    if totals.network_down:  # The network watchdog found no internet
+        raise NetworkDownError(
+            "the network went down"
+        )  # The main loop stops Chrome and waits for the internet
     if totals.browser_closed:  # Chrome died or was closed
         raise BrowserLostError(
             "the browser was closed or crashed"
@@ -583,6 +648,260 @@ def setup_logging() -> None:  # Log to the screen and optionally to a rotating f
 
 def notify_user() -> None:  # Draw attention to a waiting prompt with the terminal bell
     print("\a", end="", flush=True)  # Ring the terminal bell
+
+
+def ping_is_available() -> bool:  # Is the ping command installed?
+    return shutil.which("ping") is not None  # Found on the PATH or not
+
+
+def ping_command(
+    *, target: str
+) -> list[str]:  # The command that pings one address until it is stopped
+    if sys.platform == "win32":  # Windows pings forever with -t
+        return ["ping", "-t", target]  # Windows command
+    return [
+        "ping",
+        "-n",
+        target,
+    ]  # Linux and macOS ping forever by default (-n: no name lookups)
+
+
+def read_ping_output(
+    *, process: Any, target: str
+) -> (
+    None
+):  # Read the output of one ping process and note every reply (runs in its own thread)
+    try:  # The output stream can be closed at any moment
+        for output_line in process.stdout:  # Every line ping prints
+            if PING_REPLY_PATTERN.search(
+                output_line
+            ):  # A reply (not "unreachable" or "timeout")
+                ping_monitor.reply_at[target] = (
+                    time.monotonic()
+                )  # Remember when it arrived
+    except (OSError, ValueError):  # The stream was closed because ping was stopped
+        return  # Nothing more to read
+
+
+def spawn_ping(
+    *, target: str
+) -> None:  # Start the ping process of one address (the caller holds ping_monitor.lock)
+    try:  # Starting a process can fail
+        process = subprocess.Popen(
+            ping_command(target=target),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )  # Run ping in the background and read its output line by line
+    except OSError as error:  # The ping command cannot be started
+        logger.warning(msg=f"Could not start ping for {target}: {error}")  # Explain
+        return  # Nothing more to do
+    ping_monitor.processes[target] = process  # Remember the process
+    ping_monitor.spawned_at[target] = time.monotonic()  # Remember when it was started
+    threading.Thread(
+        target=read_ping_output,
+        kwargs={"process": process, "target": target},
+        name=f"ping-{target}",
+        daemon=True,
+    ).start()  # Read its output in the background
+
+
+def ensure_ping_running(
+    *, target: str
+) -> (
+    None
+):  # Make sure the ping of one address runs (the caller holds ping_monitor.lock)
+    process = ping_monitor.processes.get(target)  # Its current process, if any
+    if process is not None and process.poll() is None:  # It is still running
+        return  # Nothing to do
+    if (
+        time.monotonic() - ping_monitor.spawned_at.get(target, float("-inf"))
+        < PING_RESTART_MIN_SECONDS
+    ):  # It was started a moment ago (ping quits at once when the network is unreachable)
+        return  # Do not start it again and again
+    spawn_ping(target=target)  # Start it again
+
+
+def stop_ping_target(
+    *, target: str
+) -> None:  # Stop the ping of one address (the caller holds ping_monitor.lock)
+    process = ping_monitor.processes.pop(target, None)  # Forget its process
+    ping_monitor.spawned_at.pop(target, None)  # Forget its start time
+    if process is None:  # It was not running
+        return  # Nothing to stop
+    try:  # Stopping can fail
+        process.kill()  # Stop it
+        process.wait(timeout=2)  # Wait until it is gone
+    except (OSError, subprocess.TimeoutExpired):  # Already gone or stuck
+        pass  # Nothing more to do
+
+
+def last_ping_reply_at() -> (
+    float
+):  # Moment of the newest reply of any address (0 if none yet)
+    return max(list(ping_monitor.reply_at.values()), default=0.0)  # The newest reply
+
+
+def keep_ping_running() -> (
+    None
+):  # Ping the first address; ping the backup address only while the first one stays silent
+    with ping_monitor.lock:  # One thread at a time
+        primary_target = PING_TARGETS[0]  # The address that is always tried first
+        ensure_ping_running(
+            target=primary_target
+        )  # Keep its ping running (restart it if it quit)
+        primary_silent_seconds = time.monotonic() - max(
+            ping_monitor.reply_at.get(primary_target, 0.0), ping_monitor.started_at
+        )  # How long the first address has been silent
+        for backup_target in PING_TARGETS[1:]:  # Every backup address
+            if (
+                primary_silent_seconds >= PING_BACKUP_AFTER_SECONDS
+            ):  # The first address does not answer
+                if (
+                    backup_target not in ping_monitor.processes
+                ):  # The backup is not in use yet
+                    logger.info(
+                        msg=f"No ping reply from {primary_target}, also trying {backup_target}"
+                    )  # Tell the user
+                ensure_ping_running(target=backup_target)  # Ping the backup address
+            elif (
+                backup_target in ping_monitor.processes
+            ):  # The first address answers again
+                logger.info(
+                    msg=f"{primary_target} replies again, {backup_target} is not needed"
+                )  # Tell the user
+                stop_ping_target(target=backup_target)  # Stop the backup ping
+
+
+def stop_ping() -> None:  # Stop every ping process
+    with ping_monitor.lock:  # One thread at a time
+        for target in list(ping_monitor.processes):  # Every running ping
+            stop_ping_target(target=target)  # Stop it
+
+
+def start_ping() -> None:  # (Re)start the background ping from scratch
+    stop_ping()  # Stop the old ping processes
+    with ping_monitor.lock:  # One thread at a time
+        ping_monitor.reply_at.clear()  # No reply seen yet
+        ping_monitor.started_at = time.monotonic()  # The silence timer starts now
+        spawn_ping(target=PING_TARGETS[0])  # Start with the first address only
+
+
+def seconds_without_ping_reply() -> float:  # How long has ping been silent?
+    last_sign_of_life = max(
+        last_ping_reply_at(), ping_monitor.started_at
+    )  # The last reply, or the moment ping was started
+    return time.monotonic() - last_sign_of_life  # Seconds since then
+
+
+def wait_for_ping_reply(
+    *, seconds: float
+) -> bool:  # Wait for a ping reply after ping was (re)started; True if one came
+    deadline = time.monotonic() + seconds  # Moment to stop waiting
+    while time.monotonic() < deadline:  # Until the time is up
+        if (
+            last_ping_reply_at() > ping_monitor.started_at
+        ):  # A reply arrived after the start
+            return True  # The internet works
+        keep_ping_running()  # Restart a ping that quit, and try the backup address if the first stays silent
+        time.sleep(0.5)  # Look again in a moment
+    return last_ping_reply_at() > ping_monitor.started_at  # One last look
+
+
+def wait_for_network() -> (
+    None
+):  # Pause (never stop) until ping gets a reply; Chrome only starts after that
+    with (
+        ping_monitor.outage_lock
+    ):  # Wait until the watchdog has finished stopping Chrome and ping
+        totals.ping_watch_enabled = (
+            False  # The watchdog leaves Chrome alone while we wait
+        )
+    if not ping_is_available():  # Without ping the internet cannot be checked
+        return  # Carry on without monitoring
+    while True:  # Until ping gets a reply
+        start_ping()  # (Re)start ping
+        if wait_for_ping_reply(seconds=PING_FIRST_REPLY_WAIT_SECONDS):  # A reply came
+            logger.info(msg="Ping gets replies, the internet works")  # Tell the user
+            return  # Chrome may start
+        logger.warning(
+            msg=f"No ping reply. Waiting {PING_RETRY_WAIT_SECONDS}s, then ping is restarted"
+        )  # Tell the user
+        stop_ping()  # Stop ping while we wait
+        time.sleep(PING_RETRY_WAIT_SECONDS)  # Wait, then restart ping
+
+
+def stop_chrome_processes() -> (
+    None
+):  # Kill the Chrome processes of this script (safe to call from the watchdog thread)
+    if psutil is None:  # psutil is not installed
+        logger.warning(
+            msg="psutil is not installed, so Chrome cannot be stopped from outside (pip install psutil)"
+        )  # Explain
+        return  # Nothing more to do
+    profile_path = os.path.abspath(
+        BROWSER_PROFILE_FOLDER
+    )  # The profile folder that identifies our Chrome
+    for process in psutil.process_iter(["cmdline"]):  # Every running process
+        try:  # The process can vanish while we look at it
+            for argument in (
+                process.info["cmdline"] or []
+            ):  # Every command line argument
+                if (
+                    argument.startswith("--user-data-dir=")
+                    and os.path.abspath(argument.split("=", 1)[1]) == profile_path
+                ):  # This Chrome uses our profile
+                    process.kill()  # Stop it
+                    break  # Next process
+        except psutil.Error:  # Gone already or not allowed
+            continue  # Next process
+
+
+def network_watchdog_loop() -> (
+    None
+):  # Watch the ping replies in the background and stop Chrome when they stay away
+    while not watchdog_stop.wait(
+        timeout=PING_CHECK_SECONDS
+    ):  # Look now and then until the run ends
+        with (
+            ping_monitor.outage_lock
+        ):  # The main thread waits while we handle an outage
+            if (
+                not totals.ping_watch_enabled
+            ):  # Chrome is not running (or ping is not available)
+                continue  # Nothing to watch
+            keep_ping_running()  # Restart a ping process that exited
+            if (
+                seconds_without_ping_reply() < PING_SILENCE_SECONDS
+            ):  # Ping still gets replies
+                continue  # Chrome keeps going
+            totals.ping_watch_enabled = False  # Handle each outage once
+            totals.network_down = True  # Tell the main thread
+            logger.warning(
+                msg=f"No ping reply for {PING_SILENCE_SECONDS}s. Stopping Chrome and ping; they start again when ping gets replies"
+            )  # Tell the user
+            stop_ping()  # Stop ping
+            stop_chrome_processes()  # Stop Chrome, so no call stays stuck on the dead connection
+
+
+def start_network_watchdog_thread() -> (
+    None
+):  # Run the network watchdog in its own thread
+    if not ping_is_available():  # The ping command is missing
+        logger.warning(
+            msg="The ping command was not found, so the internet is not monitored"
+        )  # Explain
+    if psutil is None:  # Chrome cannot be stopped from outside
+        logger.warning(
+            msg="psutil is not installed: Chrome cannot be stopped when the internet goes down (pip install psutil)"
+        )  # Explain the limit
+    atexit.register(stop_ping)  # Never leave ping processes behind
+    threading.Thread(
+        target=network_watchdog_loop, name="network-watchdog", daemon=True
+    ).start()  # Daemon: never blocks the exit
 
 
 def wait_for_disk_space() -> None:  # PAUSE (never stop) while the disk is too full
@@ -1870,6 +2189,7 @@ def wait_for_enter(
     notify_user()  # Ring the terminal bell
     last_reminder_at = time.monotonic()  # When the prompt was last shown
     while True:  # Wait for Enter
+        raise_if_browser_closed()  # Chrome died or the internet went down while waiting
         if take_typed_line():  # Enter was pressed
             return  # Leave the function
         if stdin_state[
@@ -2919,6 +3239,11 @@ def run_session(
 def run_until_finished() -> None:  # Keep starting browser sessions until one finishes
     finished = False  # Becomes True when the whole run completed
     while not finished:  # Until a session finishes
+        wait_for_network()  # Chrome only starts after ping gets replies
+        totals.network_down = False  # A new outage is noticed from now on
+        totals.ping_watch_enabled = (
+            ping_is_available()
+        )  # From now on the watchdog stops Chrome if ping stays silent
         try:  # One session
             with sync_playwright() as playwright_instance:  # Start Playwright
                 finished = run_session(
@@ -2933,6 +3258,10 @@ def run_until_finished() -> None:  # Keep starting browser sessions until one fi
             notify_user()  # Ring the terminal bell
             totals.stopped_early = True  # Remember it for the exit code
             return  # End the run (a restart would not help)
+        except NetworkDownError as error:  # The internet went away during the run
+            logger.warning(
+                msg=f"{error}: Chrome was stopped. It starts again when ping gets replies and the run continues at the saved results page (finished documents and files are skipped)"
+            )  # Explain (the waiting happens at the top of the loop)
         except BrowserLostError as error:  # Chrome died or the session ended
             totals.restarts += 1  # Count the restart
             wait_seconds = min(
@@ -2961,6 +3290,7 @@ def main() -> int:  # The entry point; returns the exit code
     try:  # The only way to stop the script is Ctrl+C
         run_preflight_checks()  # Check terminal, write access and disk space
         log_database_overview()  # Tell what earlier runs already know
+        start_network_watchdog_thread()  # Watch the internet in the background
         run_until_finished()  # Run until everything is done
     except KeyboardInterrupt:  # The user pressed Ctrl+C
         logger.warning(
@@ -2968,6 +3298,8 @@ def main() -> int:  # The entry point; returns the exit code
         )  # Log it
         exit_code = 130  # The conventional exit code for Ctrl+C
     finally:  # Runs before exiting
+        watchdog_stop.set()  # Stop the network watchdog
+        stop_ping()  # Stop the background ping
         close_database()  # Close the local database
         log_totals()  # Print the final totals
         log_change_summary()  # List the new IDs and the new files of known IDs
