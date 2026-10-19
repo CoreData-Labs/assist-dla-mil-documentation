@@ -1,14 +1,15 @@
 # ASSIST (assist.dla.mil) PDF downloader - never-stop version: no arguments, every error is logged and skipped.
 # Everything (pages, login checks and PDF downloads) goes through Chrome, so only the browser has to be logged in.
 # Every ID is checked again on every run (new PDFs can appear later); files that are already saved are never requested again.
+# Any Chrome problem (crash, closed window, logout, broken results page) closes Chrome, restarts it, logs in again and resumes scraping.
 # Requires Python 3.13 or newer.
 
 import atexit  # Stop the background ping when the script ends
 import errno  # Recognise the "disk is full" operating system error
 import hashlib  # Fingerprint every saved PDF
-import json  # Webhook message
+import json  # Chrome settings file and keep-alive script quoting
 import logging  # Console logging
-import os  # Operating system name
+import os  # Operating system name and path helpers
 import queue  # Pass typed lines from the keyboard thread to the main thread
 import random  # Jitter for the pauses between requests
 import re  # Text pattern matching
@@ -16,7 +17,7 @@ import shutil  # Measure the free disk space
 import sqlite3  # Local database of everything seen and saved in earlier runs
 import subprocess  # Run the background ping
 import sys  # Standard input and output
-import threading  # Keyboard reader thread
+import threading  # Keyboard reader thread and watchdog thread
 import time  # Pauses and timing
 from collections.abc import (
     Callable,
@@ -39,6 +40,7 @@ from playwright.sync_api import (
     BrowserContext,
     Dialog,
     Download,
+    Locator,
     Page,
     Playwright,
     Response,
@@ -113,7 +115,7 @@ BROWSER_LAUNCH_ARGUMENTS = [
     "--disable-session-crashed-bubble",
     "--hide-crash-restore-bubble",
     "--noerrdialogs",
-]  # Chrome opens maximized (never minimized) and never shows the "Restore pages?" bubble or error dialogs
+]  # Chrome opens maximized and never shows the "Restore pages?" bubble or error dialogs
 BROWSER_IGNORED_DEFAULT_ARGUMENTS = [
     "--enable-automation",
     "--password-store=basic",
@@ -141,6 +143,15 @@ MAXIMUM_RESTART_WAIT_SECONDS = 300  # The restart wait never grows beyond 5 minu
 MAXIMUM_PAGING_BACKOFF_SECONDS = (
     300  # Waits between paging attempts and breaker pauses never grow beyond 5 minutes
 )
+MAXIMUM_PAGING_RESTARTS = 5  # Paging/reading failures in a row (without reaching a new results page) that restart Chrome before the run stops
+FATAL_BROWSER_ERROR_MARKERS = (
+    "has been closed",
+    "target closed",
+    "crashed",
+    "browser closed",
+    "connection closed",
+    "disconnected",
+)  # Lower-case Playwright error texts that mean Chrome is unusable
 FINAL_RETRY_ROUNDS = (
     1  # Extra rounds spent on documents that failed (every retry costs requests)
 )
@@ -156,6 +167,7 @@ PING_CHECK_SECONDS = 2  # How often the background watchdog looks at the ping re
 PING_RESTART_MIN_SECONDS = 5  # A ping process that exited (for example "network unreachable") is restarted at most this often
 KEEP_ALIVE_SECONDS = 240  # The browser requests a small page this often, so the session does not time out (also during long downloads)
 CIRCUIT_BREAKER_FAILURES = 5  # This many failed documents in a row pauses the run
+CIRCUIT_BREAKER_LOGIN_CHECK_AT = 2  # After this many failed documents in a row the script checks whether Chrome was logged out
 CIRCUIT_BREAKER_BASE_SECONDS = (
     30  # First breaker pause (doubles with every trip in a row)
 )
@@ -175,7 +187,9 @@ RESUME_KEY = "results_page"  # Name of the row in the resume table
 PAGES_BETWEEN_SKIP_LOGS = (
     10  # While paging forward to the saved page, log every this many pages
 )
-PAGING_MAXIMUM_ROUNDS = 5  # Rounds of attempts to page to or read a results page before the run stops with an error
+PAGING_MAXIMUM_ROUNDS = (
+    5  # Rounds of attempts to page to or read a results page before Chrome is restarted
+)
 RETRY_FAILED_EVERY_N_PAGES = (
     5  # Failed documents are retried after every this many results pages
 )
@@ -201,7 +215,7 @@ MINIMUM_DESCRIPTION_LENGTH = (
 # ===========================================================================
 # MESSAGES
 # ===========================================================================
-START_INSTRUCTIONS = (  # Start instructions shown in the terminal
+START_INSTRUCTIONS = (  # Start instructions shown in the terminal (only used when the automatic log-in fails)
     "\n>> In the browser window:\n"  # Header
     "   1. Log in\n"  # Step 1
     "   2. Go to the search page and select Advanced Search\n"  # Step 2
@@ -209,7 +223,7 @@ START_INSTRUCTIONS = (  # Start instructions shown in the terminal
     "   4. Stay on results page 1 (every ID is checked again on every run, so new IDs and new files are found)\n"  # Step 4
     "   Then press Enter here..."  # Prompt
 )  # End of the start instructions
-NOT_LOGGED_IN_REMINDER = "\n   You do not seem to be logged in yet. Log in, then press Enter here..."  # Not logged in
+NOT_LOGGED_IN_REMINDER = "\n   You do not seem to be logged in yet. Log in, then press Enter here..."  # Shown when no tab shows a logout link
 NO_RESULTS_REMINDER = (  # Shown when the results grid is missing
     "\n   I cannot see the results grid. Select Advanced Search, click Search,\n"  # Explain what to do
     "   wait for the results to appear, then press Enter here..."  # Prompt
@@ -222,7 +236,7 @@ BASE_URL = "https://assist.dla.mil"  # Base URL of the website
 PING_TARGETS = (
     "1.1.1.1",
     "8.8.8.8",
-)  # Addresses to ping in the background: the first is pinged on its own, the others (backup) only while the first gets no reply
+)  # Addresses to ping in the background: the first on its own, the others (backup) only while the first gets no reply
 PING_REPLY_PATTERN = re.compile(
     pattern=r"ttl=", flags=re.IGNORECASE
 )  # A ping reply line contains "ttl=" (Linux, macOS and Windows)
@@ -230,7 +244,7 @@ START_PAGE_URL = BASE_URL + "/online/start/"  # Log-in / start page
 SEARCH_PAGE_URL = (
     BASE_URL + "/AssistNet/Analyse/FilteredSearchA.aspx"
 )  # Page that is opened after the log-in to run the search
-KEEP_ALIVE_PATH = "/online/doc_analysis/doc_info_general.cfm?ident_number=2"  # A small read-only page the browser requests now and then (the search page is never touched)
+KEEP_ALIVE_PATH = "/online/doc_analysis/doc_info_general.cfm?ident_number=2"  # A small read-only page the browser requests now and then
 KEEP_ALIVE_JAVASCRIPT = (  # Runs inside every page of the site: the browser itself pings, so it works while Python waits for a download
     "(() => {"  # Start of the function
     "if (window.top !== window || location.hostname !== "
@@ -303,11 +317,11 @@ SUSPECT_MARKER = (
 # ===========================================================================
 # FILE NAMES
 # ===========================================================================
-RESERVED_WINDOWS_NAMES = frozenset(  # Names that Windows refuses for files and folders
-    {"CON", "PRN", "AUX", "NUL"}  # Device names
-    | {f"COM{number}" for number in range(1, 10)}  # Serial ports
-    | {f"LPT{number}" for number in range(1, 10)}  # Parallel ports
-)  # End of the reserved names
+RESERVED_WINDOWS_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)  # Names that Windows refuses for files and folders
 FOLDER_NAME_MAXIMUM_LENGTH = 60  # Maximum length of a folder name
 DESCRIPTION_MAXIMUM_LENGTH = 50  # Maximum length of the description part of a file name
 FILE_NUMBER_MAXIMUM_LENGTH = 20  # Maximum length of the file number part of a file name
@@ -330,6 +344,16 @@ DIALOG_EVENT_NAME = "dialog"  # Playwright dialog event
 RESULTS_GRID_SELECTOR = "#GV"  # Search results grid
 PAGE_LABEL_SELECTOR = "#lblPageCount"  # Page counter label
 NEXT_PAGE_BUTTON_SELECTOR = "#btnNext"  # Next page button
+JUMP_TIMEOUT_MS = 30_000  # How long a jump to a typed page number may take before it counts as failed (Next-button clicking is used instead)
+GOTO_PAGE_INPUT_SELECTORS = (  # Where the "go to page" box may be, tried in this order (if the box is not found, put its real selector FIRST in this list)
+    "#txtPgNum",  # The real page-number box of the results page (Enter in it clicks the "Go to Page" button #btnGoTo)
+    "#txtPage",  # Common ASP.NET name
+    "#txtGoToPage",  # Common ASP.NET name
+    "#txtPageNo",  # Common ASP.NET name
+    "#txtPageNumber",  # Common ASP.NET name
+    "input[id*='page' i]:not([type='hidden']):not([type='button']):not([type='submit']):not([type='image'])",  # Any visible input whose id contains "page"
+    "input[name*='page' i]:not([type='hidden']):not([type='button']):not([type='submit']):not([type='image'])",  # Any visible input whose name contains "page"
+)  # End of the selector list
 GET_OUTER_HTML_JAVASCRIPT = (
     "element => element.outerHTML"  # Extract the HTML of an element
 )
@@ -422,8 +446,23 @@ class Totals:  # Running counters and shared state
     bytes_saved: int = 0  # Total PDF bytes written
     recovered: int = 0  # Documents that failed first but worked later
     restarts: int = 0  # Browser session restarts
+    consecutive_restarts: int = (
+        0  # Restarts since the last NEW results page was reached (grows the restart wait)
+    )
+    paging_restarts: int = (
+        0  # Paging/reading failures in a row since the last NEW results page was reached
+    )
+    furthest_page: int = (
+        0  # The highest results page reached in this run (progress marker)
+    )
+    jump_failed: bool = (
+        False  # True after a page-number jump failed: the rest of the run clicks Next instead
+    )
     browser_closed: bool = (
         False  # True when Chrome died or was closed (then the session restarts)
+    )
+    active_context: Any = (
+        None  # The browser context of the running session (late events of old contexts are ignored)
     )
     ping_watch_enabled: bool = (
         False  # True while the watchdog may stop Chrome because ping gets no reply
@@ -531,7 +570,9 @@ class RefusedDownloadError(
     pass  # No custom logic needed
 
 
-class BrowserLostError(Exception):  # The browser tab or window is gone
+class BrowserLostError(
+    Exception
+):  # The browser tab or window is gone, or the session ended (Chrome is restarted)
     pass  # No custom logic needed
 
 
@@ -543,7 +584,7 @@ class NetworkDownError(
 
 class PagingFailedError(
     Exception
-):  # Paging to or reading a results page failed for good (the run stops)
+):  # Paging to or reading a results page failed for good (Chrome is restarted a few times, then the run stops)
     pass  # No custom logic needed
 
 
@@ -596,9 +637,12 @@ slow_down, speed_up, read_delay = make_delay_controller(
 
 
 def mark_browser_closed(
-    _closed_context: Any = None,
+    closed_context: Any = None,
 ) -> None:  # Called by Playwright when the browser or its window is gone
-    totals.browser_closed = True  # Remember it, so every loop can stop quickly
+    if (
+        closed_context is None or closed_context is totals.active_context
+    ):  # Ignore late close events of an OLD context (they would fake a crash of the new session)
+        totals.browser_closed = True  # Remember it, so every loop can stop quickly
 
 
 def raise_if_browser_closed() -> (
@@ -614,6 +658,53 @@ def raise_if_browser_closed() -> (
         )  # The main loop restarts the session
 
 
+def is_fatal_browser_error(
+    error: BaseException,
+) -> bool:  # Does this error text mean that Chrome is unusable?
+    error_text = str(error).lower()  # Compare in lower case
+    return any(
+        marker in error_text for marker in FATAL_BROWSER_ERROR_MARKERS
+    )  # True if any known marker appears
+
+
+def escalate_if_fatal(
+    error: BaseException,
+) -> None:  # Call inside every except block: restarts Chrome when the error is fatal
+    if is_fatal_browser_error(error):  # Chrome is closed, crashed or disconnected
+        logger.warning(msg=f"Fatal browser error: {error}")  # Tell the user
+        totals.browser_closed = True  # Remember it for every other loop
+    raise_if_browser_closed()  # Raises BrowserLostError (or NetworkDownError) when Chrome must restart
+
+
+def watch_page_for_crash(
+    page: Page,
+) -> (
+    None
+):  # Make a tab crash restart Chrome (the context close event does not fire for a crashed tab)
+    def on_crash(
+        _crashed_page: Page,
+    ) -> None:  # Called by Playwright when a tab crashes
+        logger.warning(msg="A Chrome tab crashed")  # Tell the user
+        totals.browser_closed = True  # Every loop stops and the session restarts
+
+    page.on(event="crash", f=on_crash)  # Register the handler
+
+
+def note_progress(
+    *, page_number: int
+) -> (
+    None
+):  # A results page was reached: reset the restart counters only when it is a NEW furthest page
+    if (
+        page_number > totals.furthest_page
+    ):  # Real progress (not the same page again after a restart)
+        totals.furthest_page = page_number  # Remember the new furthest page
+        totals.consecutive_restarts = (
+            0  # The next restart waits only a short time again
+        )
+        totals.paging_restarts = 0  # Paging failures start counting from zero again
+
+
 def polite_pause() -> None:  # Wait the current adaptive delay, with random jitter
     time.sleep(
         read_delay() * random.uniform(a=JITTER_MINIMUM_FACTOR, b=JITTER_MAXIMUM_FACTOR)
@@ -623,7 +714,7 @@ def polite_pause() -> None:  # Wait the current adaptive delay, with random jitt
 # ===========================================================================
 # LOGGING, ALERTS AND START-UP CHECKS
 # ===========================================================================
-def setup_logging() -> None:  # Log to the screen and optionally to a rotating file
+def setup_logging() -> None:  # Log to the screen
     if hasattr(
         sys.stdout, "reconfigure"
     ):  # Some stdout objects can change their error handling
@@ -842,9 +933,9 @@ def stop_chrome_processes() -> (
             msg="psutil is not installed, so Chrome cannot be stopped from outside (pip install psutil)"
         )  # Explain
         return  # Nothing more to do
-    profile_path = os.path.abspath(
-        BROWSER_PROFILE_FOLDER
-    )  # The profile folder that identifies our Chrome
+    profile_path = os.path.normcase(
+        os.path.abspath(BROWSER_PROFILE_FOLDER)
+    )  # The profile folder that identifies our Chrome (normcase: Windows ignores upper/lower case)
     for process in psutil.process_iter(["cmdline"]):  # Every running process
         try:  # The process can vanish while we look at it
             for argument in (
@@ -852,7 +943,8 @@ def stop_chrome_processes() -> (
             ):  # Every command line argument
                 if (
                     argument.startswith("--user-data-dir=")
-                    and os.path.abspath(argument.split("=", 1)[1]) == profile_path
+                    and os.path.normcase(os.path.abspath(argument.split("=", 1)[1]))
+                    == profile_path
                 ):  # This Chrome uses our profile
                     process.kill()  # Stop it
                     break  # Next process
@@ -1053,16 +1145,16 @@ def record_refused_file(
 ) -> None:  # Remember that the server refused a file
     try:  # The database can fail
         with get_database() as connection:  # One transaction (committed on success)
-            connection.execute(  # Insert or replace the row of this file
-                "INSERT OR REPLACE INTO refused (ident, dmxid, url, refused_at, reason) VALUES (?, ?, ?, ?, ?)",  # The statement
+            connection.execute(
+                "INSERT OR REPLACE INTO refused (ident, dmxid, url, refused_at, reason) VALUES (?, ?, ?, ?, ?)",
                 (
                     document_record["ident"],
                     pdf_link["dmxid"],
                     pdf_link["url"],
                     datetime.now().isoformat(timespec="seconds"),
                     reason,
-                ),  # The values
-            )  # End of the statement
+                ),
+            )  # Insert or replace the row of this file
     except sqlite3.Error as error:  # The database cannot be used
         logger.warning(
             msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
@@ -1079,8 +1171,8 @@ def record_file(
 ) -> None:  # Remember one saved PDF
     try:  # The database can fail
         with get_database() as connection:  # One transaction (committed on success)
-            connection.execute(  # Insert or replace the row of this file
-                "INSERT OR REPLACE INTO files (ident, dmxid, url, path, bytes, sha256, suspect, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",  # The statement
+            connection.execute(
+                "INSERT OR REPLACE INTO files (ident, dmxid, url, path, bytes, sha256, suspect, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     document_record["ident"],
                     pdf_link["dmxid"],
@@ -1090,8 +1182,8 @@ def record_file(
                     download.sha256,
                     int(suspect),
                     datetime.now().isoformat(timespec="seconds"),
-                ),  # The values
-            )  # End of the statement
+                ),
+            )  # Insert or replace the row of this file
             connection.execute(
                 "DELETE FROM refused WHERE ident = ? AND dmxid = ?",
                 (document_record["ident"], pdf_link["dmxid"]),
@@ -1240,17 +1332,16 @@ def record_document_check(
     now = datetime.now().isoformat(timespec="seconds")  # The time of this check
     try:  # The database can fail
         with get_database() as connection:  # One transaction (committed on success)
-            connection.execute(  # Insert the ID, or update its last check
-                "INSERT INTO documents (ident, doc_id, first_seen, last_checked, pdf_count) VALUES (?, ?, ?, ?, ?) "  # New ID
-                "ON CONFLICT(ident) DO UPDATE SET doc_id = excluded.doc_id, last_checked = excluded.last_checked, pdf_count = excluded.pdf_count",  # Known ID
+            connection.execute(
+                "INSERT INTO documents (ident, doc_id, first_seen, last_checked, pdf_count) VALUES (?, ?, ?, ?, ?) ON CONFLICT(ident) DO UPDATE SET doc_id = excluded.doc_id, last_checked = excluded.last_checked, pdf_count = excluded.pdf_count",
                 (
                     document_record["ident"],
                     document_record["doc_id"],
                     now,
                     now,
                     pdf_count,
-                ),  # The values
-            )  # End of the statement
+                ),
+            )  # Insert the ID, or update its last check
     except sqlite3.Error as error:  # The database cannot be used
         logger.warning(
             msg=f"Could not write to {STATE_DATABASE_FILE}: {error}"
@@ -1386,17 +1477,17 @@ def parse_detail_page(
             else []
         )  # Clean text of its cells
         pdf_links.append(
-            {  # Add the link
-                "url": absolute_url,  # Absolute download address
-                "dmxid": file_number,  # File number
+            {
+                "url": absolute_url,
+                "dmxid": file_number,
                 "description": get_cell_text(
                     cell_texts=cell_texts, column_index=DETAIL_COLUMN_DESCRIPTION
-                ),  # Description text
+                ),
                 "date": get_cell_text(
                     cell_texts=cell_texts, column_index=DETAIL_COLUMN_DATE
-                ),  # Date text
+                ),
             }
-        )  # End of the link
+        )  # Add the link with its description and date
     return pdf_links  # Hand the links back
 
 
@@ -1406,45 +1497,31 @@ def parse_detail_page(
 def make_safe_name_part(
     *, text: str | None, maximum_length: int, fallback: str
 ) -> str:  # Sanitise a string for use in a path
-    # Keep original casing, just ensure it's a string
     raw_text = str(text or "")  # Make sure it is a string
-
-    # Replace absolutely everything that is not A-Z, a-z, 0-9, or _ with a single _
     cleaned_text = re.sub(
         pattern=r"[^A-Za-z0-9_]", repl="_", string=raw_text
     )  # Replace everything except A-Z, a-z, 0-9 and _ with _
-
-    # Collapse multiple underscores into a single underscore
     cleaned_text = re.sub(
         pattern=r"_+", repl="_", string=cleaned_text
     )  # Collapse repeated underscores
-
-    # Strip underscores from the edges so it never starts or ends with _
     cleaned_text = cleaned_text.strip("_")  # Remove underscores at both ends
-
     shortened_text = cleaned_text[:maximum_length]  # Cut to the maximum length
     cut_inside_a_word = (
         len(cleaned_text) > maximum_length and cleaned_text[maximum_length] != "_"
     )  # Did the cut split a word?
-
     if (
         cut_inside_a_word and "_" in shortened_text
     ):  # A word was cut and a separator exists
         shortened_text = shortened_text.rsplit("_", 1)[
             0
         ]  # Trim back to the last separator
-
     safe_text = shortened_text.strip("_") or fallback.replace("-", "_").strip(
         "_"
     )  # The clean text, or the fallback if empty
-
     if (
         safe_text.upper() in RESERVED_WINDOWS_NAMES
     ):  # Windows cannot create CON, NUL, COM1, ... (case-insensitive check)
-        safe_text = (
-            safe_text + "_SAFE"
-        )  # Append _SAFE so we don't start with an underscore
-
+        safe_text = safe_text + "_SAFE"  # Append _SAFE so the name is allowed
     return safe_text  # Hand the safe text back
 
 
@@ -1471,20 +1548,16 @@ def build_folder_name(
     fallback_name = (
         FALLBACK_FOLDER_PREFIX + document_record["ident"]
     )  # Fallback built from the internal ID
-
-    folder_name = make_safe_name_part(
+    return make_safe_name_part(
         text=document_record["doc_id"],
         maximum_length=FOLDER_NAME_MAXIMUM_LENGTH,
         fallback=fallback_name,
     )  # Sanitised document ID
 
-    return folder_name  # Hand the folder name back
-
 
 def build_file_name(
     *, document_folder: Path, pdf_link: PdfLink
 ) -> str:  # File name of a PDF (the folder already carries the document ID)
-    # Format the date and strictly clean it to A-Z, a-z, 0-9, and _
     date_part = format_date(
         date_text=pdf_link["date"]
     )  # The date as YYYY-MM-DD (or cleaned text)
@@ -1494,22 +1567,19 @@ def build_file_name(
     date_part = re.sub(pattern=r"_+", repl="_", string=date_part).strip(
         "_"
     )  # Collapse repeated underscores and trim the ends
-
     number_part = make_safe_name_part(
         text=pdf_link["dmxid"],
         maximum_length=FILE_NUMBER_MAXIMUM_LENGTH,
         fallback=FALLBACK_FILE_NUMBER,
     )  # Sanitised file number
-
     fixed_length = (
         len(date_part)
         + len(number_part)
-        + 2  # for the two underscores used to join the three parts
+        + 2
         + len(SUSPECT_MARKER)
         + len(PDF_FILE_EXTENSION)
         + len(PARTIAL_FILE_EXTENSION)
-    )  # Everything except the description
-
+    )  # Everything except the description (2 = the joining underscores)
     description_limit = DESCRIPTION_MAXIMUM_LENGTH  # Start with the normal limit
     if os.name == "nt":  # Windows has a 260 character path limit
         room_left = (
@@ -1521,24 +1591,18 @@ def build_file_name(
         description_limit = max(
             MINIMUM_DESCRIPTION_LENGTH, min(description_limit, room_left)
         )  # Shorten the description if needed
-
     description_part = make_safe_name_part(
         text=pdf_link["description"],
         maximum_length=description_limit,
         fallback=FALLBACK_DESCRIPTION,
     )  # Sanitised description
-
-    # Join the parts using underscores (filtering out any empty parts)
     file_name_base = "_".join(
         filter(None, [description_part, date_part, number_part])
-    )  # Join the parts with underscores
-
-    # Final safety pass: no double underscores, and NO underscores right before the .pdf
+    )  # Join the parts with underscores (empty parts are dropped)
     file_name_base = re.sub(r"_+", "_", file_name_base).strip(
         "_"
     )  # No double underscores and none at the ends
-
-    file_name = file_name_base + PDF_FILE_EXTENSION  # Join the parts
+    file_name = file_name_base + PDF_FILE_EXTENSION  # Add the extension
     assert (
         len(file_name) < 255
     ), "file name too long"  # Sanity check (an AssertionError is caught per document)
@@ -1722,6 +1786,7 @@ def check_site_state(
             label="Login check",
         )  # Visit a test page
     except PlaywrightError as error:  # Network error or timeout
+        escalate_if_fatal(error)  # A dead Chrome must restart, not count as "site down"
         logger.warning(msg=f"Login check failed: {error}")  # Log why
         return SITE_DOWN  # The site does not answer
     if response.status in HTTP_RETRYABLE_STATUSES:  # Overloaded or broken
@@ -1731,6 +1796,17 @@ def check_site_state(
     ):  # 2xx and a logout link
         return SITE_OK  # Up and logged in
     return SITE_LOGGED_OUT  # Up, but not logged in
+
+
+def restart_if_logged_out(
+    *, browser_context: BrowserContext, label: str
+) -> None:  # Restart Chrome (and log in again) when the website logged us out
+    if (
+        check_site_state(browser_context=browser_context) == SITE_LOGGED_OUT
+    ):  # The session really ended
+        raise BrowserLostError(
+            f"{label}: logged out"
+        )  # Close Chrome, start it again, log in again and resume scraping
 
 
 def page_shows_logout_link(
@@ -1814,14 +1890,22 @@ def run_with_retries(
             )  # Tell the user
         except PermanentFetchError:  # Retrying cannot fix this
             raise  # Pass it straight up
-        except PlaywrightError as error:  # Network error, timeout or closed browser
+        except (
+            PlaywrightError
+        ) as error:  # Network error, timeout, crash or closed browser
             last_problem = f"network error: {error}"  # Remember the problem
+            escalate_if_fatal(
+                error
+            )  # Chrome is closed, crashed or disconnected: restart it now
             logger.warning(
                 msg=f"{label}: {last_problem}; waiting {backoff_seconds}s"
             )  # Tell the user
-            if "has been closed" in str(error):  # Playwright says the browser is gone
-                totals.browser_closed = True  # Remember it
-                raise_if_browser_closed()  # Stop retrying right now
+            if (
+                "timeout" in str(error).lower()
+            ):  # A timeout can also mean that the website logged us out (a login page never starts the download)
+                restart_if_logged_out(
+                    browser_context=browser_context, label=label
+                )  # Restart Chrome if we are logged out
         if attempt_number < RETRY_ATTEMPTS:  # Only wait if another attempt follows
             time.sleep(backoff_seconds)  # Wait before trying again
     raise PermanentFetchError(
@@ -1885,6 +1969,12 @@ def circuit_breaker(
         totals.breaker_trips = 0  # The next trip starts with a short pause again
         return  # Nothing else to do
     totals.consecutive_failures += 1  # One more failure in a row
+    if (
+        totals.consecutive_failures == CIRCUIT_BREAKER_LOGIN_CHECK_AT
+    ):  # Two failures in a row: check early whether the website logged us out
+        restart_if_logged_out(
+            browser_context=browser_context, label="documents keep failing"
+        )  # Restart Chrome if we are logged out
     if totals.consecutive_failures < CIRCUIT_BREAKER_FAILURES:  # Not enough yet
         return  # Keep going
     totals.breaker_trips += 1  # Count this trip
@@ -1897,7 +1987,7 @@ def circuit_breaker(
     )  # Explain
     wait_for_site_recovery(
         browser_context=browser_context, wait_seconds=wait_seconds
-    )  # Wait until the site is healthy
+    )  # Wait until the site is healthy (restarts Chrome if logged out)
     totals.consecutive_failures = 0  # Start counting again
     logger.info(msg="Resuming after the pause")  # Tell the user
 
@@ -2096,15 +2186,13 @@ def open_browser_context(
     clear_chrome_restore_state()  # Chrome must not offer to restore tabs from a crashed session
     try:  # The browser may not be installed
         browser_context = playwright_instance.chromium.launch_persistent_context(
-            user_data_dir=str(
-                BROWSER_PROFILE_FOLDER
-            ),  # Where the persistent profile lives
-            headless=not SHOW_BROWSER_WINDOW,  # Visible window unless switched off
-            accept_downloads=True,  # Allow Chrome to download files
-            no_viewport=True,  # No fixed 1280x720 viewport, so pages follow the window size and the window can be resized
-            args=BROWSER_LAUNCH_ARGUMENTS,  # Start the window maximized
-            ignore_default_args=BROWSER_IGNORED_DEFAULT_ARGUMENTS,  # Keep Chrome's password manager (autofill) switched on
-        )  # Launch the persistent browser
+            user_data_dir=str(BROWSER_PROFILE_FOLDER),
+            headless=not SHOW_BROWSER_WINDOW,
+            accept_downloads=True,
+            no_viewport=True,
+            args=BROWSER_LAUNCH_ARGUMENTS,
+            ignore_default_args=BROWSER_IGNORED_DEFAULT_ARGUMENTS,
+        )  # Launch the persistent browser (visible, maximized, password manager on)
     except PlaywrightError as error:  # Chromium could not start
         raise RuntimeError(
             f"Could not start Chromium ({error}). Try: playwright install --with-deps chromium"
@@ -2117,6 +2205,10 @@ def open_browser_context(
         except PlaywrightError:  # The tab is already gone
             pass  # Nothing more to do
     totals.browser_closed = False  # A fresh browser is running
+    totals.active_context = (
+        browser_context  # Only close events of THIS context count from now on
+    )
+    totals.work_page = None  # The work tab of the old session is gone
     browser_context.add_init_script(
         script=KEEP_ALIVE_JAVASCRIPT
     )  # Every page of the site keeps the session alive (never clicks Logout)
@@ -2126,6 +2218,11 @@ def open_browser_context(
     browser_context.on(
         event=DIALOG_EVENT_NAME, f=handle_alert_dialog
     )  # Accept dialogs automatically
+    for existing_page in browser_context.pages:  # Every tab that is open right now
+        watch_page_for_crash(existing_page)  # A crash of this tab restarts Chrome
+    browser_context.on(
+        event="page", f=watch_page_for_crash
+    )  # Tabs that open later are watched too
     return browser_context  # Hand the browser back
 
 
@@ -2282,6 +2379,7 @@ def try_auto_login(
             expression=LOGIN_DONE_JAVASCRIPT, timeout=AUTO_STEP_TIMEOUT_MS
         )  # Wait until the log-in form is gone
     except PlaywrightError as error:  # Click, key press or wait failed
+        escalate_if_fatal(error)  # A dead Chrome must restart
         logger.warning(msg=f"Automatic log-in failed: {error}")  # Explain
         return False  # Fall back to the manual log-in
     logger.info(msg="Automatic log-in OK")  # Tell the user
@@ -2300,6 +2398,7 @@ def run_advanced_search(
             timeout=REQUEST_TIMEOUT_MS,
         )  # Open the search page
     except PlaywrightError as error:  # The page did not load
+        escalate_if_fatal(error)  # A dead Chrome must restart
         logger.warning(msg=f"Could not open the search page: {error}")  # Explain
         return None  # Fall back to the manual steps
     for step_pattern in (
@@ -2325,6 +2424,7 @@ def run_advanced_search(
                 timeout=AUTO_STEP_TIMEOUT_MS
             )  # Click the Search button
         except PlaywrightError as error:  # Not found at all
+            escalate_if_fatal(error)  # A dead Chrome must restart
             logger.warning(msg=f"Could not click Search: {error}")  # Explain
             return None  # Fall back to the manual steps
     logger.info(msg="Clicked Search, waiting for the results grid")  # Tell the user
@@ -2332,6 +2432,7 @@ def run_advanced_search(
         time.monotonic() + REQUEST_TIMEOUT_MS / 1000
     )  # Moment to stop waiting for the grid
     while time.monotonic() < deadline:  # Until the grid shows up
+        raise_if_browser_closed()  # Chrome died or the internet went down while waiting
         results_page = find_results_page(
             browser_context=browser_context
         )  # Look for the grid on every tab
@@ -2355,6 +2456,7 @@ def open_results_grid(
             url=START_PAGE_URL, timeout=REQUEST_TIMEOUT_MS
         )  # Go to the start page
     except PlaywrightError as error:  # The page did not load
+        escalate_if_fatal(error)  # A dead Chrome must restart
         logger.warning(msg=f"Could not open the start page: {error}")  # Tell the user
     if try_auto_login(
         browser_page=browser_page
@@ -2403,7 +2505,8 @@ def read_page_numbers(
             )
             or ""
         )  # The label text
-    except PlaywrightError:  # The label could not be read
+    except PlaywrightError as error:  # The label could not be read
+        escalate_if_fatal(error)  # A dead Chrome must restart
         return None, None  # Report "unknown"
     match_found = PAGE_LABEL_PATTERN.search(
         string=label_text.replace(NON_BREAKING_SPACE, " ")
@@ -2422,15 +2525,90 @@ def read_first_ident(
         return str(
             browser_page.evaluate(expression=FIRST_IDENT_JAVASCRIPT) or ""
         )  # Run the JavaScript
-    except PlaywrightError:  # The page could not be inspected
+    except PlaywrightError as error:  # The page could not be inspected
+        escalate_if_fatal(error)  # A dead Chrome must restart
         return ""  # Report "unknown"
 
 
+def find_goto_page_input(
+    *, browser_page: Page
+) -> Locator | None:  # Find the box where a page number can be typed
+    for (
+        input_selector
+    ) in GOTO_PAGE_INPUT_SELECTORS:  # Every selector that may match the box
+        try:  # The page may be busy or closed
+            candidate = browser_page.locator(
+                selector=input_selector
+            ).first  # The first match of this selector
+            if (
+                candidate.count() > 0 and candidate.is_visible()
+            ):  # It exists and a person could see it
+                return candidate  # This is the page box
+        except PlaywrightError as error:  # The page cannot be inspected
+            escalate_if_fatal(error)  # A dead Chrome must restart
+    return None  # No page box found
+
+
+def jump_to_results_page(
+    *, browser_context: BrowserContext, browser_page: Page, target_page: int
+) -> (
+    bool
+):  # Type a page number into the page box and press Enter; True if the grid shows that page now
+    if totals.jump_failed:  # A jump already failed in this run
+        return False  # Use the Next button instead
+    page_box = find_goto_page_input(
+        browser_page=browser_page
+    )  # The box for the page number
+    if page_box is None:  # Not found
+        totals.jump_failed = True  # Do not search for it again and again
+        logger.warning(
+            msg="Could not find the 'go to page' box on the results page, clicking Next instead (put the box's selector first in GOTO_PAGE_INPUT_SELECTORS)"
+        )  # Explain
+        return False  # Use the Next button instead
+    previous_ident = read_first_ident(
+        browser_page=browser_page
+    )  # First document of the old page, to prove the grid was replaced
+    logger.info(
+        msg=f"Jumping to results page {target_page} by typing the page number"
+    )  # Tell the user
+    try:  # Typing and waiting can fail
+        page_box.click(timeout=JUMP_TIMEOUT_MS)  # Focus the box like a person would
+        page_box.fill(
+            str(target_page), timeout=JUMP_TIMEOUT_MS
+        )  # Replace its content with the page number
+        page_box.press(
+            "Enter", timeout=JUMP_TIMEOUT_MS
+        )  # Press Enter to go to that page
+        browser_page.wait_for_function(
+            expression=PAGE_CHANGE_CHECK_JAVASCRIPT,
+            arg={"pageNumber": target_page, "previousIdent": previous_ident},
+            timeout=JUMP_TIMEOUT_MS,
+        )  # Wait for the label and the rows to change
+    except PlaywrightError as error:  # Timeout or error during typing or waiting
+        escalate_if_fatal(error)  # A dead Chrome must restart
+        logger.warning(
+            msg=f"Jumping to results page {target_page} failed: {error}"
+        )  # Log it
+        current_now, _ = read_page_numbers(
+            browser_page=browser_page
+        )  # The jump may have worked, just slowly
+        if current_now == target_page:  # Already on the wanted page
+            return True  # Success after all
+        restart_if_logged_out(
+            browser_context=browser_context,
+            label=f"jumping to results page {target_page}",
+        )  # A logged-out website is a likely reason: restart Chrome and log in again
+        totals.jump_failed = True  # Click Next for the rest of this run
+        return False  # The caller clicks Next instead
+    logger.info(msg=f"Jumped to results page {target_page}")  # Tell the user
+    return True  # The grid shows the wanted page
+
+
 def go_to_next_results_page(
-    *, browser_page: Page, next_page_number: int
+    *, browser_context: BrowserContext, browser_page: Page, next_page_number: int
 ) -> (
     None
-):  # Click next and wait until the label AND the grid changed (stops the run after PAGING_MAXIMUM_ROUNDS failed rounds)
+):  # Click next and wait until the label AND the grid changed (restarts Chrome when logged out, raises PagingFailedError after PAGING_MAXIMUM_ROUNDS failed rounds)
     previous_ident = read_first_ident(
         browser_page=browser_page
     )  # First document of the old page, to prove the grid was replaced
@@ -2457,6 +2635,7 @@ def go_to_next_results_page(
                 )  # Wait for the label and the rows to change
                 return  # Success
             except PlaywrightError as error:  # Timeout or error during click or wait
+                escalate_if_fatal(error)  # A dead Chrome must restart
                 logger.warning(
                     msg=f"Going to results page {next_page_number} failed (round {round_number}, try {attempt_number}/{RETRY_ATTEMPTS}): {error}"
                 )  # Log it
@@ -2465,19 +2644,25 @@ def go_to_next_results_page(
                 )  # The click may have worked, just slowly
                 if current_now == next_page_number:  # Already on the wanted page
                     return  # Do NOT click again, or a page would be skipped
+                restart_if_logged_out(
+                    browser_context=browser_context,
+                    label=f"paging to results page {next_page_number}",
+                )  # A logged-out website is the most likely reason: restart Chrome and log in again
                 time.sleep(
                     SECONDS_PER_RETRY_STEP * attempt_number
                 )  # Short pause before the next try
         if (
             round_number >= PAGING_MAXIMUM_ROUNDS
-        ):  # Enough rounds, this will not fix itself
+        ):  # Enough rounds, this will not fix itself without a restart
             reason = f"paging to results page {next_page_number} failed in {round_number} rounds (did the site layout change?)"  # What went wrong
             record_failure(
                 document_label=f"paging to results page {next_page_number}",
                 url=SEARCH_PAGE_URL,
                 reason=reason,
             )  # Remember it for the final summary
-            raise PagingFailedError(reason)  # Stop the run with a clear error
+            raise PagingFailedError(
+                reason
+            )  # The main loop restarts Chrome (and stops only after several restarts without progress)
         wait_seconds = min(
             MAXIMUM_PAGING_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
         )  # Longer pauses between rounds
@@ -2488,7 +2673,7 @@ def go_to_next_results_page(
 
 
 def read_grid_records(
-    *, grid_page: Page, page_number: int
+    *, browser_context: BrowserContext, grid_page: Page, page_number: int
 ) -> list[
     DocumentRecord
 ]:  # Read the documents of the current results page (a failed read is never returned as an empty page)
@@ -2509,12 +2694,16 @@ def read_grid_records(
                 etree.LxmlError,
                 ValueError,
             ) as error:  # Browser or parsing problem
+                escalate_if_fatal(error)  # A dead Chrome must restart
                 logger.warning(
                     msg=f"Reading results page {page_number} failed (round {round_number}, try {attempt_number}/{RETRY_ATTEMPTS}): {error}"
                 )  # Log it
                 time.sleep(
                     SECONDS_PER_RETRY_STEP * attempt_number
                 )  # Wait before trying again
+        restart_if_logged_out(
+            browser_context=browser_context, label=f"reading results page {page_number}"
+        )  # A logged-out website empties the grid: restart Chrome and log in again
         if round_number < PAGING_MAXIMUM_ROUNDS:  # Another round follows
             wait_seconds = min(
                 MAXIMUM_PAGING_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
@@ -2529,29 +2718,34 @@ def read_grid_records(
     )  # Remember it for the final summary
     raise PagingFailedError(
         reason
-    )  # Stop the run with a clear error instead of skipping the page
+    )  # The main loop restarts Chrome instead of skipping the page
 
 
 def iterate_results_pages(
-    *, grid_page: Page
+    *, browser_context: BrowserContext, grid_page: Page
 ) -> Iterator[
     tuple[int, int, list[DocumentRecord]]
 ]:  # Yield the documents page by page
-    current_page_number, total_page_count = read_page_numbers(
-        browser_page=grid_page
-    )  # Read the first page numbers
-    while (
-        current_page_number is None or total_page_count is None
-    ):  # The page counter cannot be read
+    current_page_number: int | None = None  # The page the grid shows now
+    total_page_count: int | None = None  # The number of pages
+    for attempt_number in range(
+        1, RETRY_ATTEMPTS + 1
+    ):  # The page counter may need a moment
+        current_page_number, total_page_count = read_page_numbers(
+            browser_page=grid_page
+        )  # Read the first page numbers
+        if (
+            current_page_number is not None and total_page_count is not None
+        ):  # Both numbers were read
+            break  # Carry on
         logger.error(
             msg="Could not read 'Page X of Y' from the results page."
         )  # Explain
-        wait_for_enter(
-            browser_page=grid_page, message=NO_RESULTS_REMINDER
-        )  # Ask the user to fix the browser
-        current_page_number, total_page_count = read_page_numbers(
-            browser_page=grid_page
-        )  # Try again
+        time.sleep(SECONDS_PER_RETRY_STEP * attempt_number)  # Wait, then try again
+    else:  # The counter could never be read (no Enter prompt: this must work unattended)
+        raise BrowserLostError(
+            "cannot read 'Page X of Y'; restarting Chrome and logging in again"
+        )  # The main loop restarts Chrome
     logger.info(
         msg=f"Starting at results page {current_page_number} of {total_page_count}"
     )  # Log where we start
@@ -2563,11 +2757,26 @@ def iterate_results_pages(
             logger.info(
                 msg=f"Resuming at results page {resume_page_number} (saved by an earlier run), paging forward from page {current_page_number}"
             )  # Tell the user
+            if jump_to_results_page(
+                browser_context=browser_context,
+                browser_page=grid_page,
+                target_page=resume_page_number,
+            ):  # One step: type the page number and press Enter
+                current_page_number = (
+                    resume_page_number  # The grid shows the saved page now
+                )
+                _, jumped_total = read_page_numbers(
+                    browser_page=grid_page
+                )  # The site may have changed the page total
+                if jumped_total is not None:  # The total could be read
+                    total_page_count = jumped_total  # Use the fresh total
             while (
                 current_page_number < resume_page_number
-            ):  # Until the saved page is reached
+            ):  # Until the saved page is reached (only runs when the jump was not possible: clicks Next)
                 go_to_next_results_page(
-                    browser_page=grid_page, next_page_number=current_page_number + 1
+                    browser_context=browser_context,
+                    browser_page=grid_page,
+                    next_page_number=current_page_number + 1,
                 )  # Click Next without reading any documents
                 current_page_number += 1  # Count the page
                 if current_page_number % PAGES_BETWEEN_SKIP_LOGS == 0:  # Now and then
@@ -2584,7 +2793,9 @@ def iterate_results_pages(
             clear_resume_page()  # Forget the useless page
     while True:  # Over all pages
         page_records = read_grid_records(
-            grid_page=grid_page, page_number=current_page_number
+            browser_context=browser_context,
+            grid_page=grid_page,
+            page_number=current_page_number,
         )  # The documents of this page
         if not page_records:  # Nothing was found on this page
             logger.warning(
@@ -2594,7 +2805,9 @@ def iterate_results_pages(
         if current_page_number >= total_page_count:  # The last page was reached
             return  # End the generator
         go_to_next_results_page(
-            browser_page=grid_page, next_page_number=current_page_number + 1
+            browser_context=browser_context,
+            browser_page=grid_page,
+            next_page_number=current_page_number + 1,
         )  # Navigate to the next page
         current_page_number += 1  # Count the page
         _, latest_total = read_page_numbers(
@@ -2776,7 +2989,7 @@ def should_skip_existing_file(
         target_path,
         suspect_path,
         *find_files_by_number(document_folder=target_path.parent, pdf_link=pdf_link),
-    ):  # The recorded path, the expected names, then any file in the folder with this file number (works without a database)
+    ):  # The recorded path, the expected names, then any file in the folder with this file number
         if candidate_path is None or not candidate_path.exists():  # Nothing there
             continue  # Try the next candidate
         if not existing_file_is_valid(target_path=candidate_path):  # The file is broken
@@ -2920,7 +3133,7 @@ def download_one_pdf(
         download.partial_path.replace(
             final_path
         )  # Rename the finished file in one atomic step
-    except BrowserLostError:  # Chrome is gone
+    except BrowserLostError:  # Chrome is gone (or we were logged out)
         raise  # Let the main loop restart the session (this is not a problem of this file)
     except RefusedDownloadError as error:  # The server refused to send the file
         record_refused_file(
@@ -2942,6 +3155,9 @@ def download_one_pdf(
         )  # Remember it
         return False  # This file failed
     except Exception as error:  # Any other surprise must not stop the run either
+        escalate_if_fatal(
+            error
+        )  # But a dead Chrome must restart instead of failing document after document
         record_failure(
             document_label=file_label,
             url=pdf_link["url"],
@@ -2963,7 +3179,10 @@ def download_one_pdf(
         unlink_quietly(
             file_path=partial_path
         )  # The temporary file must never stay behind
-        polite_pause()  # Wait briefly between file downloads
+        if (
+            not totals.browser_closed and not totals.network_down
+        ):  # Do not waste time pausing when Chrome is about to restart
+            polite_pause()  # Wait briefly between file downloads
 
 
 def load_pdf_links(
@@ -3072,16 +3291,19 @@ def process_document(
         document_label + log_suffix
     )  # The label shown in the log (the stored label never gets suffixes)
     is_retry = bool(log_suffix)  # A retry has a suffix
-    try:  # NO error may escape from a single document
+    try:  # NO error may escape from a single document (except "Chrome is gone")
         document_ok = download_one_document(
             browser_context=browser_context,
             document_record=document_record,
             document_label=log_label,
             count_document=not is_retry,
         )  # Check the document
-    except BrowserLostError:  # Chrome is gone
+    except BrowserLostError:  # Chrome is gone (or we were logged out)
         raise  # Let the main loop restart the session (this is not a problem of this document)
     except Exception as error:  # Anything can go wrong
+        escalate_if_fatal(
+            error
+        )  # A dead Chrome must restart instead of failing document after document
         record_failure(
             document_label=log_label,
             url=DETAIL_PAGE_URL_TEMPLATE.format(ident),
@@ -3104,7 +3326,7 @@ def process_document(
         )  # Remember it for the next retry round
     circuit_breaker(
         browser_context=browser_context, document_ok=document_ok
-    )  # Pause if too many documents fail in a row
+    )  # Check for a logout after 2 failures in a row, pause after 5
     return document_ok  # Report the result
 
 
@@ -3156,6 +3378,7 @@ def process_results_page(
             raise BrowserLostError(
                 "the results tab was closed"
             )  # The main loop restarts the session
+        raise_if_browser_closed()  # Chrome died or the internet went down
         ident = document_record["ident"]  # Internal document ID
         if ident in seen_idents:  # Already checked in this run (no second request)
             logger.info(
@@ -3181,12 +3404,12 @@ def download_all_documents(
 ) -> None:  # Control the whole downloading process
     grid_page = open_results_grid(
         browser_context=browser_context
-    )  # Wait until the results grid is shown
+    )  # Log in, search and wait until the results grid is shown
     seen_idents: set[str] = (
         set()
     )  # Documents seen in this session (a document on two pages is done once)
     for page_number, total_page_count, page_records in iterate_results_pages(
-        grid_page=grid_page
+        browser_context=browser_context, grid_page=grid_page
     ):  # Every results page
         logger.info(
             msg=f"=== Results page {page_number}/{total_page_count}: {len(page_records)} documents ==="
@@ -3194,6 +3417,9 @@ def download_all_documents(
         save_resume_page(
             page_number=page_number, total_pages=total_page_count
         )  # Remember this page, so a restart or crash continues here
+        note_progress(
+            page_number=page_number
+        )  # A new furthest page resets the restart counters
         process_results_page(
             browser_context=browser_context,
             grid_page=grid_page,
@@ -3230,10 +3456,22 @@ def run_session(
         return True  # The whole run finished normally
     finally:  # Runs no matter what
         logger.info(msg="Closing the browser")  # Log the shutdown
+        totals.active_context = None  # Late close events of this context must not fake a crash of the next session
+        totals.work_page = None  # The work tab dies with the browser
         try:  # Closing can fail
             browser_context.close()  # Close the browser
         except PlaywrightError:  # The browser is already gone
             pass  # Nothing more to do
+
+
+def restart_wait_seconds() -> (
+    int
+):  # Count a restart and say how long to wait before the next session
+    totals.restarts += 1  # Count the restart for the summary
+    totals.consecutive_restarts += 1  # Count it for the growing wait
+    return min(
+        MAXIMUM_RESTART_WAIT_SECONDS, RESTART_WAIT_SECONDS * totals.consecutive_restarts
+    )  # Wait longer after every restart without progress
 
 
 def run_until_finished() -> None:  # Keep starting browser sessions until one finishes
@@ -3252,36 +3490,43 @@ def run_until_finished() -> None:  # Keep starting browser sessions until one fi
         except (
             PagingFailedError
         ) as error:  # Paging or reading a results page failed for good
-            logger.error(
-                msg=f"STOPPING: {error}. Fix the problem, then run again; finished documents and files are skipped."
-            )  # Say clearly why the run ends
-            notify_user()  # Ring the terminal bell
-            totals.stopped_early = True  # Remember it for the exit code
-            return  # End the run (a restart would not help)
+            totals.paging_restarts += 1  # Count it
+            if (
+                totals.paging_restarts > MAXIMUM_PAGING_RESTARTS
+            ):  # Restarting did not help several times in a row
+                logger.error(
+                    msg=f"STOPPING: {error}. Restarting Chrome {MAXIMUM_PAGING_RESTARTS} times did not help. Fix the problem, then run again; finished documents and files are skipped."
+                )  # Say clearly why the run ends
+                notify_user()  # Ring the terminal bell
+                totals.stopped_early = True  # Remember it for the exit code
+                return  # End the run
+            wait_seconds = restart_wait_seconds()  # How long to wait
+            logger.warning(
+                msg=f"{error}: restarting Chrome and logging in again in {wait_seconds}s (finished documents and files are skipped)"
+            )  # Explain
+            time.sleep(wait_seconds)  # Wait before the next session
         except NetworkDownError as error:  # The internet went away during the run
             logger.warning(
                 msg=f"{error}: Chrome was stopped. It starts again when ping gets replies and the run continues at the saved results page (finished documents and files are skipped)"
             )  # Explain (the waiting happens at the top of the loop)
-        except BrowserLostError as error:  # Chrome died or the session ended
-            totals.restarts += 1  # Count the restart
-            wait_seconds = min(
-                MAXIMUM_RESTART_WAIT_SECONDS, RESTART_WAIT_SECONDS * totals.restarts
-            )  # Wait longer after every restart
+        except (
+            BrowserLostError
+        ) as error:  # Chrome died, a tab crashed or the session ended (logout)
+            wait_seconds = restart_wait_seconds()  # How long to wait
             logger.warning(
-                msg=f"{error}: the browser was closed. Starting again with an automatic log-in in {wait_seconds}s (finished documents and files are skipped)"
+                msg=f"{error}: restarting Chrome with an automatic log-in in {wait_seconds}s (finished documents and files are skipped)"
             )  # Explain
             time.sleep(wait_seconds)  # Wait before the next session
         except (
             Exception
-        ):  # Any crash of the session (browser closed, Chromium missing, ...)
-            totals.restarts += 1  # Count the restart
-            wait_seconds = min(
-                MAXIMUM_RESTART_WAIT_SECONDS, RESTART_WAIT_SECONDS * totals.restarts
-            )  # Wait longer after every crash
+        ):  # Any other crash of the session (browser closed, Chromium missing, ...)
+            wait_seconds = restart_wait_seconds()  # How long to wait
             logger.exception(
                 msg=f"The session crashed; restarting in {wait_seconds}s (finished documents and files are skipped)"
             )  # Log the traceback
             time.sleep(wait_seconds)  # Wait before the next session
+        finally:  # Runs after every session
+            totals.ping_watch_enabled = False  # No Chrome is running between sessions, so the watchdog must not stop anything
 
 
 def main() -> int:  # The entry point; returns the exit code
