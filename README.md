@@ -2,7 +2,6 @@
 
 <img width="800" height="148" alt="welcome_new_middle" src="https://raw.githubusercontent.com/PrajwalKoirala638/assist-dla-mil-documentation/refs/heads/main/Assets/welcome_new_middle.gif" />
 
-
 ### A friendly, organized home for education and benefits documents — built to help everyone, in every field, everywhere.
 
 Welcome! 👋 This repository brings together official documents about education and other benefits in one easy-to-browse place. Whether you're a student, a veteran, a family member, a healthcare worker, an engineer, a lawyer, a community organizer, or a developer building the next helpful tool — if you or someone you know could benefit from clearer access to this information, this project is for you.
@@ -27,9 +26,60 @@ Benefits information is often scattered across multiple websites, buried in dens
 
 ```
 assist-dla-mil-documentation/
-├── PDFs/          ← All source documents live here
-├── README.md      ← You are here
-└── LICENSE
+├── Assets
+│   ├── Filtered Search.pdf
+│   ├── Filtered Search.xlsx
+│   ├── README.md
+│   └── welcome_new_middle.gif
+├── LICENSE
+├── PDFs
+│   ├── DOD_A_10825A_1_NOT_1
+│   │   ├── Revision_A_1979_10_22_287108.pdf
+│   │   ├── Revision_A_Amendment_1_1994_10_25_26094.pdf
+│   │   └── Revision_A_Notice_1_Cancellation_1997_06_30_75495.pdf
+│   ├── DOD_A_15707D_2_NOT_2
+│   │   ├── Revision_D_1978_10_25_191727.pdf
+│   │   ├── Revision_D_Amendment_1_1983_05_03_192743.pdf
+│   │   ├── Revision_D_Amendment_2_1989_01_25_192597.pdf
+│   │   ├── Revision_D_Notice_1_Inactivation_2016_08_04_5742566.pdf
+│   │   └── Revision_D_Notice_2_Validation_2026_01_09_5797902.pdf
+│   ├── DOD_A_17254A_NOT_2
+│   │   ├── Revision_A_1985_08_23_211536.pdf
+│   │   ├── Revision_A_Notice_1_Inactivation_2015_09_22_5737020.pdf
+│   │   └── Revision_A_Notice_2_Validation_2025_08_27_5796185.pdf
+│   ├── DOD_B_15072E_SUP_1_NOT_1
+│   │   ├── Revision_E_1981_09_02_51558.pdf
+│   │   ├── Revision_E_Notice_1_Cancellation_1998_06_17_109891.pdf
+│   │   ├── Revision_E_Notice_1_Validation_1989_04_20_52299.pdf
+│   │   └── Revision_E_Supplement_1_1981_09_02_51559.pdf
+│   ├── DOD_B_15072_10_NOT_1
+│   │   ├── Base_Document_1981_09_02_287114.pdf
+│   │   └── Notice_1_Cancellation_1998_06_17_109885.pdf
+│   ├── DOD_B_15072_11_NOT_1
+│   │   ├── Base_Document_1981_09_02_287116.pdf
+│   │   └── Notice_1_Cancellation_1998_06_17_109883.pdf
+│   ├── DOD_B_15072_12_NOT_1
+│   │   ├── Base_Document_1981_09_02_287118.pdf
+│   │   └── Notice_1_Cancellation_1998_06_17_109881.pdf
+│   ├── DOD_B_15072_13_NOT_1
+│   │   ├── Base_Document_1981_09_02_287121.pdf
+│   │   └── Notice_1_Cancellation_1998_06_17_109879.pdf
+│   ├── DOD_B_15072_14_NOT_1
+│   │   ├── Base_Document_1981_09_02_16801.pdf
+│   │   └── Notice_1_Cancellation_1998_06_17_109876.pdf
+│   ├── DOD_B_15072_1B_NOT_1
+│   │   └── Revision_B_Notice_1_Cancellation_1981_09_02_437559.pdf
+│   ├── DOD_B_15072_2B_NOT_1
+│   │   └── Revision_B_Notice_1_Cancellation_1981_09_02_437591.pdf
+│   ├── DOD_B_15072_3F_NOT_1
+│   │   ├── Revision_F_1981_09_02_287112.pdf
+│   │   └── Revision_F_Notice_1_Cancellation_1998_06_17_109889.pdf
+├── README.md
+├── assist_data
+│   ├── browser_profile
+│   └── state.sqlite3
+├── main.py
+└── upload.sh
 ```
 
 ### 📂 `PDFs/`
