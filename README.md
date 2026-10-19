@@ -47,9 +47,18 @@ As documents are added, it helps to keep `PDFs/` organized — for example, by p
 
 **Suggested file listing format** (fill in as documents are added):
 
-| File                    | Program / Topic              | Summary                                    |
-| ----------------------- | ---------------------------- | ------------------------------------------ |
-| `PDFs/example-file.pdf` | _(e.g., Tuition Assistance)_ | _(one-line description of what it covers)_ |
+| File                                                                                                 | Program / Topic                     | Summary                                                                                                |
+| ---------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/`                                                                     | MIL-PRF-1N                          | Folder containing Revision N, Revision M, and earlier revisions, amendments, supplements, and notices. |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_N_Amendment_1_amendment_incorporated_2022_03_14_5776338.pdf` | MIL-PRF-1N Revision N Amendment 1   | Revision N specification with Amendment 1 incorporated, dated March 14, 2022.                          |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_N_Notice_1_Validation_2017_02_08_5744979.pdf`                | MIL-PRF-1N Revision N Notice 1      | Validation notice for Revision N, dated February 8, 2017.                                              |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_N_2011_10_12_5713324.pdf`                                    | MIL-PRF-1N Revision N               | Revision N specification dated October 12, 2011.                                                       |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_Supplement_1B_2006_10_24_603754.pdf`                       | MIL-PRF-1N Revision M Supplement 1B | Supplement 1B to Revision M, dated October 24, 2006.                                                   |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_Amendment_2_all_previous_amendments_2006_03_10_601014.pdf` | MIL-PRF-1N Revision M Amendment 2   | Revision M with previous amendments incorporated, dated March 10, 2006.                                |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_Supplement_1A_2005_11_10_486795.pdf`                       | MIL-PRF-1N Revision M Supplement 1A | Supplement 1A to Revision M, dated November 10, 2005.                                                  |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_Amendment_1_amendment_incorporated_2005_11_10_486766.pdf`  | MIL-PRF-1N Revision M Amendment 1   | Revision M with Amendment 1 incorporated, dated November 10, 2005.                                     |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_Supplement_1_2003_06_11_412943.pdf`                        | MIL-PRF-1N Revision M Supplement 1  | Supplement 1 to Revision M, dated June 11, 2003.                                                       |
+| `PDFs/MIL_PRF_1N_1_SUP_1_NOT_1/Revision_M_2003_05_09_411369.pdf`                                     | MIL-PRF-1N Revision M               | Revision M specification dated May 9, 2003.                                                            |
 
 ---
 
