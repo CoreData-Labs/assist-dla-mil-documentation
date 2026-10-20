@@ -152,6 +152,8 @@ FATAL_BROWSER_ERROR_MARKERS = (
     "connection closed",
     "disconnected",
 )  # Lower-case Playwright error texts that mean Chrome is unusable
+REDIRECT_LOOP_MARKER = "err_too_many_redirects"  # Lower-case Chrome error text of a redirect loop (the session cookies are invalid: the site keeps bouncing between log-in and the page)
+SITE_DOWN_RESTART_AFTER_CHECKS = 3  # After this many failed site checks in a row while waiting, Chrome is closed and the script waits for the internet before starting again
 FINAL_RETRY_ROUNDS = (
     1  # Extra rounds spent on documents that failed (every retry costs requests)
 )
@@ -455,6 +457,9 @@ class Totals:  # Running counters and shared state
     furthest_page: int = (
         0  # The highest results page reached in this run (progress marker)
     )
+    clear_cookies_on_start: bool = (
+        False  # True after a redirect loop: the next Chrome start deletes the site cookies and logs in fresh
+    )
     jump_failed: bool = (
         False  # True after a page-number jump failed: the rest of the run clicks Next instead
     )
@@ -670,6 +675,18 @@ def is_fatal_browser_error(
 def escalate_if_fatal(
     error: BaseException,
 ) -> None:  # Call inside every except block: restarts Chrome when the error is fatal
+    if (
+        REDIRECT_LOOP_MARKER in str(error).lower()
+    ):  # A redirect loop never fixes itself: the session cookies are invalid
+        logger.warning(
+            msg=f"Redirect loop (the session is no longer valid): {error}"
+        )  # Tell the user
+        totals.clear_cookies_on_start = (
+            True  # The next Chrome start deletes the cookies and logs in again
+        )
+        raise BrowserLostError(
+            "redirect loop (ERR_TOO_MANY_REDIRECTS): closing Chrome and logging in again"
+        )  # Close Chrome and start again
     if is_fatal_browser_error(error):  # Chrome is closed, crashed or disconnected
         logger.warning(msg=f"Fatal browser error: {error}")  # Tell the user
         totals.browser_closed = True  # Remember it for every other loop
@@ -1941,6 +1958,7 @@ def fetch_page_with_retries(
 def wait_for_site_recovery(
     *, browser_context: BrowserContext, wait_seconds: float
 ) -> None:  # Wait until the site is up and we are logged in
+    failed_checks = 0  # Site checks that failed in a row
     while True:  # Until the site is healthy again
         time.sleep(wait_seconds)  # Pause
         raise_if_browser_closed()  # A dead browser cannot recover by waiting
@@ -1953,6 +1971,13 @@ def wait_for_site_recovery(
             raise BrowserLostError(
                 "logged out during the pause"
             )  # Close the browser and start over with an automatic log-in
+        failed_checks += 1  # One more failed check
+        if (
+            failed_checks >= SITE_DOWN_RESTART_AFTER_CHECKS
+        ):  # Waiting with an open Chrome does not help
+            raise NetworkDownError(
+                "the site does not answer; closing Chrome and waiting for the internet"
+            )  # The main loop closes Chrome, waits for ping replies, then starts again
         wait_seconds = min(
             MAXIMUM_PAGING_BACKOFF_SECONDS, wait_seconds * 2
         )  # The site is still down: wait longer
@@ -2205,6 +2230,15 @@ def open_browser_context(
         except PlaywrightError:  # The tab is already gone
             pass  # Nothing more to do
     totals.browser_closed = False  # A fresh browser is running
+    if totals.clear_cookies_on_start:  # The last session ended in a redirect loop
+        try:  # Clearing can fail
+            browser_context.clear_cookies()  # Delete the broken session cookies (the saved password logs in again)
+            logger.info(
+                msg="Deleted the old site cookies, logging in fresh"
+            )  # Tell the user
+        except PlaywrightError as error:  # Chrome refused
+            logger.warning(msg=f"Could not delete the cookies: {error}")  # Carry on
+        totals.clear_cookies_on_start = False  # Done
     totals.active_context = (
         browser_context  # Only close events of THIS context count from now on
     )
@@ -3507,8 +3541,11 @@ def run_until_finished() -> None:  # Keep starting browser sessions until one fi
             time.sleep(wait_seconds)  # Wait before the next session
         except NetworkDownError as error:  # The internet went away during the run
             logger.warning(
-                msg=f"{error}: Chrome was stopped. It starts again when ping gets replies and the run continues at the saved results page (finished documents and files are skipped)"
-            )  # Explain (the waiting happens at the top of the loop)
+                msg=f"{error}: Chrome was closed. It starts again when ping gets replies and the run continues at the saved results page (finished documents and files are skipped)"
+            )  # Explain (the waiting for ping happens at the top of the loop)
+            time.sleep(
+                restart_wait_seconds()
+            )  # Short pause, so a dead website cannot cause a restart loop even when ping works
         except (
             BrowserLostError
         ) as error:  # Chrome died, a tab crashed or the session ended (logout)
