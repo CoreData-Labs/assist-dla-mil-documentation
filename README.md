@@ -175,7 +175,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install the required Python packages
-pip install playwright lxml
+pip install playwright lxml psutil
 
 # Install Playwright browsers and their dependencies
 playwright install --with-deps chromium
