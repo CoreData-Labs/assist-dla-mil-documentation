@@ -220,4 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Chrome Assets
-assist_data/
+assist_data/browser_profile/
