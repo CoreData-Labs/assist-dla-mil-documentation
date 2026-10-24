@@ -3,11 +3,18 @@
 # Everything (pages, login checks and PDF downloads) goes through Chrome, so only the browser has to be logged in.
 # Every document ID is checked again on every run (new PDFs can appear later); saved files are never requested again.
 # Any Chrome problem (crash, closed window, logout, broken results page) restarts Chrome, logs in again and resumes.
+# DOWNLOADS: every PDF is fetched INSIDE Chrome (same cookies, same network stack) with a hard timeout, checked for
+# completeness (size, %PDF start, %%EOF end) and downloaded again automatically when it fails or looks incomplete.
+# MULTI-THREADED: the main thread owns the ONE Chrome window and walks the results pages; WORKER_COUNT worker
+# threads each connect to that same Chrome over a local debugging port and process documents in their OWN TABS.
 # Requires Python 3.13 or newer (it uses the `type` statement).
 
 # ===========================================================================
 # IMPORTS
 # ===========================================================================
+# Decodes the PDF pieces that Chrome hands over as base64 text
+import base64
+
 # Stops the background ping processes when the script ends
 import atexit
 
@@ -37,6 +44,9 @@ import re
 
 # Measures free disk space, finds programs on the PATH and deletes folders
 import shutil
+
+# Finds a free local port for Chrome's remote-debugging connection
+import socket
 
 # Local database of everything seen and saved in earlier runs
 import sqlite3
@@ -293,9 +303,7 @@ KEYBOARD_POLL_MS = 300
 # If terminal input is closed, prompts continue by themselves after this many seconds
 CLOSED_INPUT_WAIT_SECONDS = 5
 # Log line layout: time with milliseconds, level, thread name, function name, message
-LOG_LINE_FORMAT = (
-    "%(asctime)s.%(msecs)03d [%(levelname)s] [%(threadName)s] %(funcName)s: %(message)s"
-)
+LOG_LINE_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] [%(threadName)s] %(funcName)s: %(message)s"
 # Layout of the time in a log line (milliseconds are added by the format above)
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Piece size when hashing a saved PDF
@@ -306,6 +314,24 @@ MAXIMUM_NON_PDF_BYTES = 2 * 1024 * 1024
 MAXIMUM_WINDOWS_PATH_LENGTH = 240
 # The description part of a file name is never shortened below this many characters
 MINIMUM_DESCRIPTION_LENGTH = 10
+# Number of worker threads (each one works in its own tab of the single Chrome window); the request rate grows with it
+WORKER_COUNT = 5
+# How many waiting documents the queue holds per worker (a small queue keeps the saved resume page accurate)
+QUEUE_SLOTS_PER_WORKER = 2
+# How often a waiting thread looks again at the queue and at the abort flag, in seconds
+QUEUE_POLL_SECONDS = 0.5
+# Chrome's debugging port only listens on this local address, so nothing outside this computer can connect
+REMOTE_DEBUGGING_HOST = "127.0.0.1"
+# How a PDF is downloaded: "fetch" (inside Chrome, with a timeout; recommended) or "click" (Chrome's own download event)
+DOWNLOAD_METHOD = "fetch"
+# A single PDF download may take this long in milliseconds before it counts as failed and is downloaded again
+DOWNLOAD_TIMEOUT_MS = 600_000
+# The PDF is moved from Chrome to Python in pieces of this many bytes (keeps memory use and message sizes small)
+DOWNLOAD_CHUNK_BYTES = 3 * 1024 * 1024
+# A PDF without the %%EOF end marker is downloaded again this many times before it is accepted as "suspect"
+INCOMPLETE_DOWNLOAD_REDOWNLOADS = 2
+# How often a worker tries to connect to the shared Chrome before the session is restarted
+WORKER_CONNECT_ATTEMPTS = 3
 
 # ===========================================================================
 # MESSAGES
@@ -320,9 +346,7 @@ START_INSTRUCTIONS = (
     "   Then press Enter here..."
 )
 # Shown when no tab shows a logout link
-NOT_LOGGED_IN_REMINDER = (
-    "\n   You do not seem to be logged in yet. Log in, then press Enter here..."
-)
+NOT_LOGGED_IN_REMINDER = "\n   You do not seem to be logged in yet. Log in, then press Enter here..."
 # Shown when the results grid is missing
 NO_RESULTS_REMINDER = (
     "\n   I cannot see the results grid. Select Advanced Search, click Search,\n"
@@ -385,9 +409,7 @@ SEARCH_BUTTON_FALLBACK_SELECTOR = (
     "button:text-is('Search')"
 )
 # Document page URL (the {} is replaced by the internal document ID)
-DOCUMENT_PAGE_URL_TEMPLATE = (
-    BASE_URL + "/online/doc_analysis/doc_info_general.cfm?ident_number={}"
-)
+DOCUMENT_PAGE_URL_TEMPLATE = BASE_URL + "/online/doc_analysis/doc_info_general.cfm?ident_number={}"
 # A known internal document ID used to verify that the session is logged in
 LOGIN_CHECK_INTERNAL_ID = 2
 # Folder where PDFs are saved
@@ -531,6 +553,46 @@ CLICK_DOWNLOAD_JAVASCRIPT = (
     "if (!existing) { link.remove(); }"
     "}"
 )
+# Downloads one file inside Chrome and keeps its bytes in the page; the timer guarantees that the call always ends
+FETCH_PDF_JAVASCRIPT = (
+    # Takes {url, timeoutMs}
+    "async (request) => {"
+    # An abort controller stops a stalled download after the timeout
+    "const controller = new AbortController();"
+    "const timer = setTimeout(() => controller.abort(), request.timeoutMs);"
+    "try {"
+    # Same-origin request with the log-in cookies, never from the cache
+    "const response = await fetch(request.url, {credentials: 'include', cache: 'no-store', signal: controller.signal});"
+    # Read the whole body (the abort also stops a stalled body)
+    "const bytes = new Uint8Array(await response.arrayBuffer());"
+    # Keep the bytes in the page until Python has read them
+    "window.__assistPdfBytes = bytes;"
+    # Report what Python needs to judge the download
+    "return {status: response.status, statusText: response.statusText, "
+    "contentType: response.headers.get('content-type') || '', "
+    "contentLength: response.headers.get('content-length') || '', "
+    "contentEncoding: response.headers.get('content-encoding') || '', "
+    "retryAfter: response.headers.get('retry-after') || '', size: bytes.length};"
+    "} finally { clearTimeout(timer); }"
+    "}"
+)
+# Returns one piece of the downloaded bytes as base64 text (null when the page lost the bytes)
+READ_PDF_CHUNK_JAVASCRIPT = (
+    # Takes [offset, length]
+    "([offset, length]) => {"
+    "const bytes = window.__assistPdfBytes;"
+    "if (!bytes) { return null; }"
+    "const slice = bytes.subarray(offset, offset + length);"
+    "let binary = '';"
+    # Convert in small steps, because a huge argument list would overflow the call stack
+    "for (let position = 0; position < slice.length; position += 32768) {"
+    "binary += String.fromCharCode.apply(null, slice.subarray(position, position + 32768));"
+    "}"
+    "return btoa(binary);"
+    "}"
+)
+# Frees the memory of the downloaded bytes inside the page
+DISCARD_PDF_JAVASCRIPT = "() => { delete window.__assistPdfBytes; }"
 # All rows of the results grid
 GRID_ROW_XPATH = "//table[@id='GV']//tr"
 # The fireMe link of a row
@@ -556,9 +618,7 @@ DOCUMENT_COLUMN_DATE = 3
 # Extracts the internal ID from a JavaScript call
 OPEN_DOCUMENT_CALL_PATTERN = re.compile(pattern=r"fireMe\('(?P<internal_id>\d+)'\)")
 # Extracts the page numbers from "Page X of Y"
-PAGE_LABEL_PATTERN = re.compile(
-    pattern=r"Page\s+(?P<current>\d+)\s+of\s+(?P<total>\d+)"
-)
+PAGE_LABEL_PATTERN = re.compile(pattern=r"Page\s+(?P<current>\d+)\s+of\s+(?P<total>\d+)")
 # Only logged-in pages contain this
 LOGOUT_LINK_MARKER = "logout.cfm"
 # Indicates a login page
@@ -640,8 +700,8 @@ class RunState:
     # Breaker trips in a row (grows the pause)
     circuit_breaker_trips: int = 0
     # --- Shared resources ---
-    # The dedicated Chrome tab for document pages and downloads
-    download_tab: Page | None = None
+    # The local TCP port on which this session's Chrome accepts the worker threads' connections
+    remote_debugging_port: int = 0
     # The local database (opened on first use)
     database_connection: sqlite3.Connection | None = None
     # True when the database was empty at the start (then nothing is announced as new)
@@ -672,33 +732,40 @@ class AdaptiveDelay:
     maximum_seconds: float
     # The delay in effect right now (set to the base delay in __post_init__)
     current_seconds: float = 0.0
+    # Protects the delay because several worker threads change it
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     # Start with the normal delay
     def __post_init__(self) -> None:
         self.current_seconds = self.base_seconds
 
-    # Double the delay because the server complained
+    # Double the delay because the server complained (safe to call from several threads)
     def increase(self) -> None:
-        # Remember the old value for the log
-        old_seconds = self.current_seconds
-        # Double it but respect the maximum
-        self.current_seconds = min(self.maximum_seconds, old_seconds * 2)
-        # Report the change
-        logger.debug(
-            "Delay increased: %.2fs -> %.2fs", old_seconds, self.current_seconds
-        )
+        # Only one thread at a time may change the delay
+        with self.lock:
+            # Remember the old value for the log
+            old_seconds = self.current_seconds
+            # Double it but respect the maximum
+            self.current_seconds = min(self.maximum_seconds, old_seconds * 2)
+            # Remember the new value for the log
+            new_seconds = self.current_seconds
+        # Only report real changes (at the maximum nothing changes any more)
+        if new_seconds != old_seconds:
+            logger.debug("Delay increased: %.2fs -> %.2fs", old_seconds, new_seconds)
 
-    # Move the delay back towards normal after a success
+    # Move the delay back towards normal after a success (safe to call from several threads)
     def decrease(self) -> None:
-        # Remember the old value for the log
-        old_seconds = self.current_seconds
-        # Shrink it by 20 percent but never below the normal delay
-        self.current_seconds = max(self.base_seconds, old_seconds * 0.8)
+        # Only one thread at a time may change the delay
+        with self.lock:
+            # Remember the old value for the log
+            old_seconds = self.current_seconds
+            # Shrink it by 20 percent but never below the normal delay
+            self.current_seconds = max(self.base_seconds, old_seconds * 0.8)
+            # Remember the new value for the log
+            new_seconds = self.current_seconds
         # Only report real changes
-        if self.current_seconds != old_seconds:
-            logger.debug(
-                "Delay decreased: %.2fs -> %.2fs", old_seconds, self.current_seconds
-            )
+        if new_seconds != old_seconds:
+            logger.debug("Delay decreased: %.2fs -> %.2fs", old_seconds, new_seconds)
 
 
 # State of the background ping processes and the time of the last reply
@@ -723,9 +790,7 @@ run_state = RunState()
 # The one background ping state object
 ping_monitor = PingMonitor()
 # The one adaptive delay
-request_delay = AdaptiveDelay(
-    base_seconds=SECONDS_BETWEEN_REQUESTS, maximum_seconds=MAXIMUM_DELAY_SECONDS
-)
+request_delay = AdaptiveDelay(base_seconds=SECONDS_BETWEEN_REQUESTS, maximum_seconds=MAXIMUM_DELAY_SECONDS)
 # The named logger (its handlers are added in setup_logging)
 logger = logging.getLogger(name="assist")
 # Every line typed in the terminal
@@ -734,6 +799,20 @@ keyboard_lines: queue.Queue[str] = queue.Queue()
 keyboard_reader_state = {"started": False, "closed": False}
 # Set at the end of the run to stop the network watchdog
 watchdog_stop_event = threading.Event()
+# Protects the counters of run_state that several threads change
+state_lock = threading.RLock()
+# Protects the one shared SQLite connection
+database_lock = threading.RLock()
+# Held by the worker that pauses for the circuit breaker, so the other workers wait for the pause too
+circuit_breaker_lock = threading.Lock()
+# Per-thread storage (every thread has its own download tab)
+thread_local = threading.local()
+# Set when any thread hit a problem that ends the current browser session (all threads then stop)
+session_abort_event = threading.Event()
+# The errors that ended the session (only the first one is kept and re-raised by the main thread)
+session_abort_errors: list[BaseException] = []
+# Set when the main thread asks the workers to stop normally (errors during that shutdown are then ignored)
+worker_shutdown_event = threading.Event()
 
 
 # ===========================================================================
@@ -787,6 +866,14 @@ class PagingFailedError(Exception):
 # ===========================================================================
 # SMALL REUSABLE HELPERS
 # ===========================================================================
+# Add to one numeric counter of run_state without losing updates from other threads
+def add_to_counter(*, counter_name: str, amount: int = 1) -> None:
+    # Only one thread at a time may change the counters
+    with state_lock:
+        # Read the counter, add the amount and store the result
+        setattr(run_state, counter_name, getattr(run_state, counter_name) + amount)
+
+
 # Sleep for a number of seconds and log pauses that are long enough to matter
 def sleep_and_log(*, seconds: float) -> None:
     # Only report pauses worth mentioning
@@ -797,6 +884,18 @@ def sleep_and_log(*, seconds: float) -> None:
         logger.debug("Sleeping %.1fs (called from %s)", seconds, caller_name)
     # Really sleep
     time.sleep(seconds)
+
+
+# Sleep for a number of seconds, but wake up at once when the browser session is aborted (used by the workers)
+def sleep_unless_session_aborted(*, seconds: float) -> None:
+    # Only report pauses worth mentioning
+    if seconds >= LOG_SLEEPS_FROM_SECONDS:
+        # Name of the function that is sleeping (one frame up the call stack)
+        caller_name = sys._getframe(1).f_code.co_name
+        # Report the pause
+        logger.debug("Sleeping %.1fs unless the session is aborted (called from %s)", seconds, caller_name)
+    # Returns early as soon as the abort flag is set
+    session_abort_event.wait(timeout=seconds)
 
 
 # Current local time as ISO text without fractions (used in the database)
@@ -829,13 +928,11 @@ def delete_file_quietly(*, file_path: Path) -> None:
 # Wait the current adaptive delay with random jitter
 def polite_pause() -> None:
     # Delay multiplied by a random factor, so requests do not look machine-regular
-    pause_seconds = request_delay.current_seconds * random.uniform(
-        a=JITTER_MINIMUM_FACTOR, b=JITTER_MAXIMUM_FACTOR
-    )
+    pause_seconds = request_delay.current_seconds * random.uniform(a=JITTER_MINIMUM_FACTOR, b=JITTER_MAXIMUM_FACTOR)
     # Report the pause (always, even when short)
     logger.debug("Polite pause %.2fs", pause_seconds)
-    # Sleep that long
-    time.sleep(pause_seconds)
+    # Sleep that long, but wake up at once when the browser session is aborted
+    session_abort_event.wait(timeout=pause_seconds)
 
 
 # Called by Playwright when the browser or its window is gone
@@ -858,6 +955,10 @@ def raise_if_browser_unusable() -> None:
     if run_state.browser_is_closed:
         # The main loop restarts the session
         raise BrowserLostError("the browser was closed or crashed")
+    # Another thread already ended the session, so this thread stops its work too
+    if session_abort_event.is_set():
+        # The main thread re-raises the ORIGINAL error once all threads have stopped
+        raise BrowserLostError("another thread ended the browser session")
 
 
 # Does this error text mean that Chrome is unusable?
@@ -877,9 +978,7 @@ def restart_browser_if_error_is_fatal(error: BaseException) -> None:
         # The next Chrome start deletes the cookies and logs in again
         run_state.clear_cookies_on_next_start = True
         # Close Chrome and start again
-        raise BrowserLostError(
-            "redirect loop (ERR_TOO_MANY_REDIRECTS): closing Chrome and logging in again"
-        )
+        raise BrowserLostError("redirect loop (ERR_TOO_MANY_REDIRECTS): closing Chrome and logging in again")
     # Chrome is closed, crashed or disconnected
     if error_means_browser_is_unusable(error=error):
         # Tell the user
@@ -893,19 +992,13 @@ def restart_browser_if_error_is_fatal(error: BaseException) -> None:
 # Log everything one tab does
 def attach_tab_logging(tab: Page) -> None:
     # Browser console output
-    tab.on(
-        "console",
-        lambda message: logger.debug("[console] %s: %s", message.type, message.text),
-    )
+    tab.on("console", lambda message: logger.debug("[console] %s: %s", message.type, message.text))
     # JavaScript errors on the page
     tab.on("pageerror", lambda error: logger.warning("[page error] %s", error))
     # Every navigation of every frame
     tab.on("framenavigated", lambda frame: logger.debug("[navigated] %s", frame.url))
     # HTML parsed
-    tab.on(
-        "domcontentloaded",
-        lambda loaded_tab: logger.debug("[domcontentloaded] %s", loaded_tab.url),
-    )
+    tab.on("domcontentloaded", lambda loaded_tab: logger.debug("[domcontentloaded] %s", loaded_tab.url))
     # Page fully loaded
     tab.on("load", lambda loaded_tab: logger.debug("[load] %s", loaded_tab.url))
     # A new window was opened by the page
@@ -915,9 +1008,7 @@ def attach_tab_logging(tab: Page) -> None:
     # A download began
     tab.on(
         "download",
-        lambda download: logger.info(
-            "[download started] %s -> %s", download.url, download.suggested_filename
-        ),
+        lambda download: logger.info("[download started] %s -> %s", download.url, download.suggested_filename),
     )
 
 
@@ -926,36 +1017,21 @@ def attach_network_logging(browser_context: BrowserContext) -> None:
     # Every request sent
     browser_context.on(
         "request",
-        lambda request: logger.debug(
-            "[request] %s %s (%s)", request.method, request.url, request.resource_type
-        ),
+        lambda request: logger.debug("[request] %s %s (%s)", request.method, request.url, request.resource_type),
     )
     # Every response received
-    browser_context.on(
-        "response",
-        lambda response: logger.debug(
-            "[response] %s %s", response.status, response.url
-        ),
-    )
+    browser_context.on("response", lambda response: logger.debug("[response] %s %s", response.status, response.url))
     # Every failed request
     browser_context.on(
         "requestfailed",
-        lambda request: logger.warning(
-            "[request failed] %s %s: %s", request.method, request.url, request.failure
-        ),
+        lambda request: logger.warning("[request failed] %s %s: %s", request.method, request.url, request.failure),
     )
     # Every completed request
-    browser_context.on(
-        "requestfinished",
-        lambda request: logger.debug("[request finished] %s", request.url),
-    )
+    browser_context.on("requestfinished", lambda request: logger.debug("[request finished] %s", request.url))
 
 
-# Make a tab crash restart Chrome (the context close event does not fire for a crashed tab) and log the tab
-def watch_tab_for_crash(tab: Page) -> None:
-    # Start logging this tab
-    attach_tab_logging(tab)
-
+# Mark the browser as closed when a tab crashes (the context close event does not fire for a crashed tab)
+def attach_tab_crash_handler(tab: Page) -> None:
     # Called by Playwright when the tab crashes
     def on_tab_crash(_crashed_tab: Page) -> None:
         # Tell the user
@@ -965,6 +1041,14 @@ def watch_tab_for_crash(tab: Page) -> None:
 
     # Register the crash handler
     tab.on(event="crash", f=on_tab_crash)
+
+
+# Log everything a tab does and make a crash of it restart Chrome
+def watch_tab_for_crash(tab: Page) -> None:
+    # Start logging this tab
+    attach_tab_logging(tab)
+    # Watch for a crash of this tab
+    attach_tab_crash_handler(tab)
 
 
 # A results page was reached: reset the restart counters only when it is a NEW furthest page
@@ -1096,10 +1180,7 @@ def restart_ping_if_stopped(*, target: str) -> None:
     if process is not None and process.poll() is None:
         return
     # It was started a moment ago (ping quits at once when the network is unreachable): do not restart again and again
-    if (
-        time.monotonic() - ping_monitor.spawned_at.get(target, float("-inf"))
-        < PING_RESTART_MIN_SECONDS
-    ):
+    if time.monotonic() - ping_monitor.spawned_at.get(target, float("-inf")) < PING_RESTART_MIN_SECONDS:
         return
     # Start it again
     start_ping_process(target=target)
@@ -1152,17 +1233,13 @@ def maintain_ping_processes() -> None:
                 # The backup is not in use yet
                 if backup_target not in ping_monitor.processes:
                     # Tell the user
-                    logger.info(
-                        f"No ping reply from {primary_target}, also trying {backup_target}"
-                    )
+                    logger.info(f"No ping reply from {primary_target}, also trying {backup_target}")
                 # Ping the backup address
                 restart_ping_if_stopped(target=backup_target)
             # The first address answers again and the backup still runs
             elif backup_target in ping_monitor.processes:
                 # Tell the user
-                logger.info(
-                    f"{primary_target} replies again, {backup_target} is not needed"
-                )
+                logger.info(f"{primary_target} replies again, {backup_target} is not needed")
                 # Stop the backup ping
                 stop_ping_process(target=backup_target)
 
@@ -1243,9 +1320,7 @@ def wait_until_internet_works() -> None:
             # Chrome may start
             return
         # Tell the user
-        logger.warning(
-            f"No ping reply. Waiting {PING_RETRY_WAIT_SECONDS}s, then ping is restarted"
-        )
+        logger.warning(f"No ping reply. Waiting {PING_RETRY_WAIT_SECONDS}s, then ping is restarted")
         # Stop ping while we wait
         stop_all_ping_processes()
         # Wait, then restart ping
@@ -1257,9 +1332,7 @@ def kill_chrome_processes() -> None:
     # psutil is not installed
     if psutil is None:
         # Explain
-        logger.warning(
-            "psutil is not installed, so Chrome cannot be stopped from outside (pip install psutil)"
-        )
+        logger.warning("psutil is not installed, so Chrome cannot be stopped from outside (pip install psutil)")
         # Nothing more to do
         return
     # The profile folder that identifies our Chrome (normcase: Windows ignores upper/lower case)
@@ -1273,8 +1346,7 @@ def kill_chrome_processes() -> None:
                 # This Chrome uses our profile folder
                 if (
                     argument.startswith("--user-data-dir=")
-                    and os.path.normcase(os.path.abspath(argument.split("=", 1)[1]))
-                    == profile_path
+                    and os.path.normcase(os.path.abspath(argument.split("=", 1)[1])) == profile_path
                 ):
                     # Report the kill
                     logger.debug("Killing Chrome process %s", process.pid)
@@ -1299,10 +1371,7 @@ def run_network_watchdog() -> None:
                 # Nothing to watch
                 continue
             # Show the silence timer on every look
-            logger.debug(
-                "Watchdog: %.0fs since the last ping reply",
-                seconds_without_ping_reply(),
-            )
+            logger.debug("Watchdog: %.0fs since the last ping reply", seconds_without_ping_reply())
             # Restart a ping process that exited
             maintain_ping_processes()
             # Ping still gets replies
@@ -1329,21 +1398,15 @@ def start_network_watchdog_thread() -> None:
     # The ping command is missing
     if not ping_command_exists():
         # Explain
-        logger.warning(
-            "The ping command was not found, so the internet is not monitored"
-        )
+        logger.warning("The ping command was not found, so the internet is not monitored")
     # Chrome cannot be stopped from outside
     if psutil is None:
         # Explain the limit
-        logger.warning(
-            "psutil is not installed: Chrome cannot be stopped when the internet goes down (pip install psutil)"
-        )
+        logger.warning("psutil is not installed: Chrome cannot be stopped when the internet goes down (pip install psutil)")
     # Never leave ping processes behind
     atexit.register(stop_all_ping_processes)
     # Daemon: never blocks the exit
-    threading.Thread(
-        target=run_network_watchdog, name="network-watchdog", daemon=True
-    ).start()
+    threading.Thread(target=run_network_watchdog, name="network-watchdog", daemon=True).start()
     # Report the start
     logger.info("Network watchdog thread started")
 
@@ -1353,14 +1416,9 @@ def wait_for_free_disk_space() -> None:
     # The folder must exist so its disk can be measured
     PDF_FOLDER.mkdir(parents=True, exist_ok=True)
     # Show the free space on every check
-    logger.debug(
-        "Free disk space: %d MB",
-        shutil.disk_usage(path=PDF_FOLDER).free // BYTES_PER_MEGABYTE,
-    )
+    logger.debug("Free disk space: %d MB", shutil.disk_usage(path=PDF_FOLDER).free // BYTES_PER_MEGABYTE)
     # Compare with the safety margin
-    while (
-        free_bytes := shutil.disk_usage(path=PDF_FOLDER).free
-    ) < MINIMUM_FREE_DISK_BYTES:
+    while (free_bytes := shutil.disk_usage(path=PDF_FOLDER).free) < MINIMUM_FREE_DISK_BYTES:
         # Tell the user
         logger.warning(
             f"Only {free_bytes // BYTES_PER_MEGABYTE} MB of disk space left. "
@@ -1377,9 +1435,7 @@ def run_preflight_checks() -> None:
     # The Enter prompts work best in a real terminal
     if not sys.stdin.isatty():
         # Warn only
-        logger.warning(
-            "stdin is not a terminal; if input ends, the Enter prompts continue by themselves"
-        )
+        logger.warning("stdin is not a terminal; if input ends, the Enter prompts continue by themselves")
     # Test that we may write in the output folder
     try:
         # Make sure the folder exists
@@ -1420,11 +1476,10 @@ def get_database_connection() -> sqlite3.Connection:
         # Make sure the folder exists
         OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
         # Open (or create) the database file
-        connection = sqlite3.connect(database=str(STATE_DATABASE_FILE))
+        # check_same_thread=False lets every thread use it (database_lock allows only one at a time); timeout waits for locks
+        connection = sqlite3.connect(database=str(STATE_DATABASE_FILE), check_same_thread=False, timeout=30)
         # Show every SQL statement (cut at 300 characters)
-        connection.set_trace_callback(
-            lambda statement: logger.debug("SQL: %s", " ".join(statement.split())[:300])
-        )
+        connection.set_trace_callback(lambda statement: logger.debug("SQL: %s", " ".join(statement.split())[:300]))
         # Create the tables if they are missing
         connection.executescript(DATABASE_SCHEMA)
         # Remember the connection
@@ -1449,8 +1504,8 @@ def close_database_connection() -> None:
 def write_to_database(*, statements: list[tuple[str, tuple]]) -> None:
     # The database can fail
     try:
-        # One transaction (committed on success, rolled back on error)
-        with get_database_connection() as connection:
+        # Only one thread at a time may use the shared connection; one transaction (committed on success, rolled back on error)
+        with database_lock, get_database_connection() as connection:
             # Every (sql, parameters) pair
             for sql_text, parameters in statements:
                 # Run it
@@ -1465,8 +1520,10 @@ def write_to_database(*, statements: list[tuple[str, tuple]]) -> None:
 def read_database_row(*, sql_text: str, parameters: tuple = ()) -> Any:
     # The database can fail
     try:
-        # Run the query and take the first row
-        return get_database_connection().execute(sql_text, parameters).fetchone()
+        # Only one thread at a time may use the shared connection
+        with database_lock:
+            # Run the query and take the first row
+            return get_database_connection().execute(sql_text, parameters).fetchone()
     # The database cannot be used
     except sqlite3.Error as error:
         # Warn and carry on
@@ -1482,9 +1539,7 @@ def log_database_overview() -> None:
         # Open the database
         connection = get_database_connection()
         # IDs known
-        document_count = connection.execute(
-            "SELECT COUNT(*) FROM documents"
-        ).fetchone()[0]
+        document_count = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         # Files known
         file_count = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     # The database cannot be used
@@ -1517,8 +1572,7 @@ def is_document_known(*, internal_id: str) -> bool:
 def find_recorded_file_path(*, internal_id: str, file_number: str) -> Path | None:
     # Look it up
     row = read_database_row(
-        sql_text="SELECT path FROM files WHERE ident = ? AND dmxid = ?",
-        parameters=(internal_id, file_number),
+        sql_text="SELECT path FROM files WHERE ident = ? AND dmxid = ?", parameters=(internal_id, file_number)
     )
     # Nothing known
     if row is None or row is DATABASE_UNAVAILABLE:
@@ -1538,15 +1592,11 @@ def was_file_refused_recently(*, internal_id: str, file_number: str) -> bool:
     if row is None or row is DATABASE_UNAVAILABLE:
         return False
     # Recent enough to leave it alone
-    return datetime.now() - datetime.fromisoformat(row[0]) < timedelta(
-        hours=REFUSED_RECHECK_HOURS
-    )
+    return datetime.now() - datetime.fromisoformat(row[0]) < timedelta(hours=REFUSED_RECHECK_HOURS)
 
 
 # Remember that the server refused a file
-def record_refused_file(
-    *, document_record: DocumentRecord, pdf_link: PdfLink, reason: str
-) -> None:
+def record_refused_file(*, document_record: DocumentRecord, pdf_link: PdfLink, reason: str) -> None:
     # Insert or replace the row of this file
     write_to_database(
         statements=[
@@ -1617,11 +1667,7 @@ def record_suspect_retry(*, document_record: DocumentRecord, pdf_link: PdfLink) 
         statements=[
             (
                 "INSERT OR REPLACE INTO suspect_checks (ident, dmxid, checked_at) VALUES (?, ?, ?)",
-                (
-                    document_record["internal_id"],
-                    pdf_link["file_number"],
-                    current_timestamp_iso(),
-                ),
+                (document_record["internal_id"], pdf_link["file_number"], current_timestamp_iso()),
             )
         ]
     )
@@ -1646,10 +1692,7 @@ def load_saved_results_page() -> int | None:
     if not RESUME_FROM_SAVED_PAGE:
         return None
     # Look up the saved page
-    row = read_database_row(
-        sql_text="SELECT page_number FROM resume WHERE name = ?",
-        parameters=(RESUME_KEY,),
-    )
+    row = read_database_row(sql_text="SELECT page_number FROM resume WHERE name = ?", parameters=(RESUME_KEY,))
     # Nothing saved (or database unusable): start at the page the browser shows
     if row is None or row is DATABASE_UNAVAILABLE:
         return None
@@ -1677,9 +1720,7 @@ def clear_saved_results_page() -> None:
 
 
 # Record a file that is on disk but unknown to the database (no request involved)
-def record_file_found_on_disk(
-    *, document_record: DocumentRecord, pdf_link: PdfLink, saved_path: Path
-) -> None:
+def record_file_found_on_disk(*, document_record: DocumentRecord, pdf_link: PdfLink, saved_path: Path) -> None:
     # Reading the file can fail
     try:
         # Inspect and hash the file on the local disk
@@ -1709,13 +1750,7 @@ def record_document_checked(*, document_record: DocumentRecord, pdf_count: int) 
                 "INSERT INTO documents (ident, doc_id, first_seen, last_checked, pdf_count) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(ident) DO UPDATE SET doc_id = excluded.doc_id, "
                 "last_checked = excluded.last_checked, pdf_count = excluded.pdf_count",
-                (
-                    document_record["internal_id"],
-                    document_record["public_id"],
-                    now,
-                    now,
-                    pdf_count,
-                ),
+                (document_record["internal_id"], document_record["public_id"], now, now, pdf_count),
             )
         ]
     )
@@ -1735,22 +1770,16 @@ def announce_new_document(*, document_record: DocumentRecord) -> None:
 
 
 # Announce a new file on an ID that earlier runs already knew
-def announce_new_file(
-    *, document_record: DocumentRecord, pdf_link: PdfLink, document_is_new: bool
-) -> None:
+def announce_new_file(*, document_record: DocumentRecord, pdf_link: PdfLink, document_is_new: bool) -> None:
     # New IDs were announced already
     if document_is_new:
         return
     # Internal ID
     internal_id = document_record["internal_id"]
     # Remember it for the final summary
-    run_state.updated_documents.setdefault(internal_id, []).append(
-        pdf_link["file_number"]
-    )
+    run_state.updated_documents.setdefault(internal_id, []).append(pdf_link["file_number"])
     # Announce it
-    logger.info(
-        f"NEW FILE on known ID {internal_id} ({document_record['public_id']}): file {pdf_link['file_number']}"
-    )
+    logger.info(f"NEW FILE on known ID {internal_id} ({document_record['public_id']}): file {pdf_link['file_number']}")
 
 
 # ===========================================================================
@@ -1759,9 +1788,7 @@ def announce_new_file(
 # Extract and clean the text of an HTML element
 def extract_clean_text(*, html_element: Any) -> str:
     # Replace non-breaking spaces and collapse all whitespace
-    return " ".join(
-        html_element.text_content().replace(NON_BREAKING_SPACE, " ").split()
-    )
+    return " ".join(html_element.text_content().replace(NON_BREAKING_SPACE, " ").split())
 
 
 # Safely get the text of one cell (empty text when the row is shorter)
@@ -1786,9 +1813,7 @@ def parse_results_grid(*, html_text: str) -> list[DocumentRecord]:
     # Every row of the results table
     for table_row in html_document.xpath(GRID_ROW_XPATH):
         # The document link of the row
-        match_found = OPEN_DOCUMENT_CALL_PATTERN.search(
-            string=table_row.xpath(GRID_LINK_XPATH) or ""
-        )
+        match_found = OPEN_DOCUMENT_CALL_PATTERN.search(string=table_row.xpath(GRID_LINK_XPATH) or "")
         # Header row, footer row, ...
         if not match_found:
             continue
@@ -1800,17 +1825,12 @@ def parse_results_grid(*, html_text: str) -> list[DocumentRecord]:
         # Remember this ID
         seen_internal_ids.add(internal_id)
         # Clean text of all cells
-        cell_texts = [
-            extract_clean_text(html_element=cell)
-            for cell in table_row.xpath(ROW_CELLS_XPATH)
-        ]
+        cell_texts = [extract_clean_text(html_element=cell) for cell in table_row.xpath(ROW_CELLS_XPATH)]
         # Add the record
         document_records.append(
             {
                 "internal_id": internal_id,
-                "public_id": get_cell_text_or_empty(
-                    cell_texts=cell_texts, column_index=GRID_COLUMN_PUBLIC_ID
-                ),
+                "public_id": get_cell_text_or_empty(cell_texts=cell_texts, column_index=GRID_COLUMN_PUBLIC_ID),
             }
         )
     # Show every document found on the page
@@ -1834,13 +1854,9 @@ def parse_document_page(*, html_text: str, page_url: str) -> list[PdfLink]:
     # Every PDF link of the page
     for link_element in html_document.xpath(PDF_LINK_XPATH):
         # lxml already decoded entities, so the href is never decoded again
-        absolute_url = urljoin(
-            base=page_url, url=link_element.get(key="href", default="")
-        )
+        absolute_url = urljoin(base=page_url, url=link_element.get(key="href", default=""))
         # The file number from the URL
-        file_number = parse_qs(qs=urlparse(url=absolute_url).query).get(
-            FILE_NUMBER_QUERY_NAME, [""]
-        )[0]
+        file_number = parse_qs(qs=urlparse(url=absolute_url).query).get(FILE_NUMBER_QUERY_NAME, [""])[0]
         # The link has no file number at all
         if not file_number:
             # Invent a unique one so file names never collide
@@ -1854,10 +1870,7 @@ def parse_document_page(*, html_text: str, page_url: str) -> list[PdfLink]:
         parent_rows = link_element.xpath(PARENT_ROW_XPATH)
         # Clean text of its cells
         cell_texts = (
-            [
-                extract_clean_text(html_element=cell)
-                for cell in parent_rows[0].xpath(PARENT_ROW_CELLS_XPATH)
-            ]
+            [extract_clean_text(html_element=cell) for cell in parent_rows[0].xpath(PARENT_ROW_CELLS_XPATH)]
             if parent_rows
             else []
         )
@@ -1866,12 +1879,8 @@ def parse_document_page(*, html_text: str, page_url: str) -> list[PdfLink]:
             {
                 "download_url": absolute_url,
                 "file_number": file_number,
-                "description": get_cell_text_or_empty(
-                    cell_texts=cell_texts, column_index=DOCUMENT_COLUMN_DESCRIPTION
-                ),
-                "date_text": get_cell_text_or_empty(
-                    cell_texts=cell_texts, column_index=DOCUMENT_COLUMN_DATE
-                ),
+                "description": get_cell_text_or_empty(cell_texts=cell_texts, column_index=DOCUMENT_COLUMN_DESCRIPTION),
+                "date_text": get_cell_text_or_empty(cell_texts=cell_texts, column_index=DOCUMENT_COLUMN_DATE),
             }
         )
     # Show how many PDF links were found
@@ -1903,9 +1912,7 @@ def sanitize_name_part(*, text: str | None, maximum_length: int, fallback: str) 
     # Cut to the maximum length
     shortened_text = cleaned_text[:maximum_length]
     # Did the cut split a word?
-    cut_inside_a_word = (
-        len(cleaned_text) > maximum_length and cleaned_text[maximum_length] != "_"
-    )
+    cut_inside_a_word = len(cleaned_text) > maximum_length and cleaned_text[maximum_length] != "_"
     # A word was cut and a separator exists
     if cut_inside_a_word and "_" in shortened_text:
         # Trim back to the last separator
@@ -1927,18 +1934,14 @@ def format_date_for_file_name(*, date_text: str) -> str:
         # The layout may not fit
         try:
             # Parse and reformat
-            return datetime.strptime(date_text.strip(), date_format).strftime(
-                DATE_OUTPUT_FORMAT
-            )
+            return datetime.strptime(date_text.strip(), date_format).strftime(DATE_OUTPUT_FORMAT)
         # This layout does not fit
         except ValueError:
             # Try the next layout
             continue
     # No layout fits: use the sanitised raw text
     return sanitize_name_part(
-        text=date_text,
-        maximum_length=FILE_NUMBER_MAXIMUM_LENGTH,
-        fallback=FALLBACK_DATE_TEXT,
+        text=date_text, maximum_length=FILE_NUMBER_MAXIMUM_LENGTH, fallback=FALLBACK_DATE_TEXT
     )
 
 
@@ -1956,17 +1959,13 @@ def build_folder_name(*, document_record: DocumentRecord) -> str:
 def build_file_name(*, document_folder: Path, pdf_link: PdfLink) -> str:
     # The date as YYYY-MM-DD (or cleaned text), reduced to safe characters
     date_part = re.sub(
-        pattern=r"[^A-Za-z0-9_]",
-        repl="_",
-        string=format_date_for_file_name(date_text=pdf_link["date_text"]),
+        pattern=r"[^A-Za-z0-9_]", repl="_", string=format_date_for_file_name(date_text=pdf_link["date_text"])
     )
     # Collapse repeated underscores and trim the ends
     date_part = re.sub(pattern=r"_+", repl="_", string=date_part).strip("_")
     # Sanitised file number
     number_part = sanitize_name_part(
-        text=pdf_link["file_number"],
-        maximum_length=FILE_NUMBER_MAXIMUM_LENGTH,
-        fallback=FALLBACK_FILE_NUMBER,
+        text=pdf_link["file_number"], maximum_length=FILE_NUMBER_MAXIMUM_LENGTH, fallback=FALLBACK_FILE_NUMBER
     )
     # Everything except the description (2 = the joining underscores)
     fixed_length = (
@@ -1982,26 +1981,15 @@ def build_file_name(*, document_folder: Path, pdf_link: PdfLink) -> str:
     # Windows has a 260 character path limit
     if os.name == "nt":
         # Characters left for the description
-        room_left = (
-            MAXIMUM_WINDOWS_PATH_LENGTH
-            - len(str(document_folder.resolve()))
-            - 1
-            - fixed_length
-        )
+        room_left = MAXIMUM_WINDOWS_PATH_LENGTH - len(str(document_folder.resolve())) - 1 - fixed_length
         # Shorten the description if needed (but never below the minimum)
-        description_limit = max(
-            MINIMUM_DESCRIPTION_LENGTH, min(description_limit, room_left)
-        )
+        description_limit = max(MINIMUM_DESCRIPTION_LENGTH, min(description_limit, room_left))
     # Sanitised description
     description_part = sanitize_name_part(
-        text=pdf_link["description"],
-        maximum_length=description_limit,
-        fallback=FALLBACK_DESCRIPTION,
+        text=pdf_link["description"], maximum_length=description_limit, fallback=FALLBACK_DESCRIPTION
     )
     # Join the parts with underscores (empty parts are dropped), with no double underscores and none at the ends
-    file_name_base = re.sub(
-        r"_+", "_", "_".join(filter(None, [description_part, date_part, number_part]))
-    ).strip("_")
+    file_name_base = re.sub(r"_+", "_", "_".join(filter(None, [description_part, date_part, number_part]))).strip("_")
     # Add the extension
     file_name = file_name_base + PDF_FILE_EXTENSION
     # Sanity check (an AssertionError is caught per document)
@@ -2036,9 +2024,7 @@ def parse_retry_after_seconds(*, header_value: str | None) -> int | None:
             # Parse the HTTP date
             retry_moment = parsedate_to_datetime(data=stripped_value)
             # Seconds from now until then
-            seconds = int(
-                (retry_moment - datetime.now(tz=retry_moment.tzinfo)).total_seconds()
-            )
+            seconds = int((retry_moment - datetime.now(tz=retry_moment.tzinfo)).total_seconds())
         # Something we do not handle
         except (TypeError, ValueError, OverflowError):
             # Fall back to the normal backoff
@@ -2048,9 +2034,7 @@ def parse_retry_after_seconds(*, header_value: str | None) -> int | None:
 
 
 # Turn bad HTTP status codes into the right error
-def check_http_status(
-    *, status_code: int, status_text: str, headers: dict[str, str], label: str
-) -> None:
+def check_http_status(*, status_code: int, status_text: str, headers: dict[str, str], label: str) -> None:
     # Look at the status code
     match status_code:
         # Not logged in (any more)
@@ -2062,13 +2046,9 @@ def check_http_status(
         # 408, 429, 5xx, ...: probably temporary
         case code if code in HTTP_RETRYABLE_STATUSES:
             # Respect Retry-After if given
-            wait_seconds = parse_retry_after_seconds(
-                header_value=headers.get(RETRY_AFTER_HEADER_NAME)
-            )
+            wait_seconds = parse_retry_after_seconds(header_value=headers.get(RETRY_AFTER_HEADER_NAME))
             # Ask the caller to retry later
-            raise RetryableFetchError(
-                f"{label}: HTTP {code} {status_text} (temporary)", wait_seconds
-            )
+            raise RetryableFetchError(f"{label}: HTTP {code} {status_text} (temporary)", wait_seconds)
         # Success, but no content
         case 204:
             raise PermanentFetchError(f"{label}: HTTP 204 - the server sent no content")
@@ -2111,9 +2091,7 @@ def raise_error_for_non_pdf(*, file_body: bytes, description: str) -> None:
     if not file_body.strip():
         raise RetryableFetchError("the PDF response was empty")
     # Anything else: retrying will not help
-    raise PermanentFetchError(
-        f"the downloaded file is not a PDF ({description}, {len(file_body)} bytes)"
-    )
+    raise PermanentFetchError(f"the downloaded file is not a PDF ({description}, {len(file_body)} bytes)")
 
 
 # ===========================================================================
@@ -2130,30 +2108,30 @@ def get_first_open_tab(*, browser_context: BrowserContext) -> Page:
     return browser_context.new_page()
 
 
-# The dedicated tab for document pages and downloads (the results grid tab is never touched)
+# The calling thread's own tab for document pages and downloads (the results grid tab is never touched)
 def get_download_tab(*, browser_context: BrowserContext) -> Page:
-    # The tab remembered from earlier
-    download_tab = run_state.download_tab
+    # The tab this thread opened earlier (each thread has its own)
+    download_tab = getattr(thread_local, "download_tab", None)
     # Missing, closed or from a crashed session
-    if (
-        download_tab is None
-        or download_tab.is_closed()
-        or download_tab.context is not browser_context
-    ):
+    if download_tab is None or download_tab.is_closed() or download_tab.context is not browser_context:
         # Report it
         logger.debug("Opening a new download tab")
-        # Open a fresh tab
+        # Open a fresh TAB in the one Chrome window (never a new window)
         download_tab = browser_context.new_page()
-        # Remember it
-        run_state.download_tab = download_tab
+        # Worker tabs are created over the worker's own connection, so the worker itself watches them
+        if threading.current_thread() is not threading.main_thread():
+            # A crash of this tab restarts Chrome
+            attach_tab_crash_handler(download_tab)
+            # Accept dialogs of this tab automatically
+            download_tab.on(event="dialog", f=accept_browser_dialog)
+        # Remember it for this thread only
+        thread_local.download_tab = download_tab
     # Hand the tab back
     return download_tab
 
 
 # Visit a page in Chrome and return (response, page HTML as bytes, final URL)
-def open_url_in_download_tab(
-    *, browser_context: BrowserContext, url: str, label: str
-) -> tuple[Response, bytes, str]:
+def open_url_in_download_tab(*, browser_context: BrowserContext, url: str, label: str) -> tuple[Response, bytes, str]:
     # Log the address
     logger.info(f"{label}: Opening {url}")
     # Remember when the visit started
@@ -2161,9 +2139,7 @@ def open_url_in_download_tab(
     # The dedicated tab
     download_tab = get_download_tab(browser_context=browser_context)
     # Let Chrome load the page like a person
-    response = download_tab.goto(
-        url=url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_MS
-    )
+    response = download_tab.goto(url=url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_MS)
     # The navigation was replaced by another one
     if response is None:
         raise RetryableFetchError(f"{label}: Chrome gave no response")
@@ -2233,11 +2209,7 @@ def tab_shows_logout_link(*, tab: Page) -> bool:
 
 # React to a 401/403: if we are logged out restart the browser; otherwise carry on
 def handle_login_problem(
-    *,
-    browser_context: BrowserContext,
-    label: str,
-    error: Exception,
-    backoff_seconds: float,
+    *, browser_context: BrowserContext, label: str, error: Exception, backoff_seconds: float
 ) -> None:
     # Is the site up and are we logged in?
     site_state = check_site_state(browser_context=browser_context)
@@ -2248,17 +2220,13 @@ def handle_login_problem(
     # A 403 while the session is fine
     if site_state == SITE_OK and isinstance(error, ForbiddenError):
         # This file is off limits
-        raise PermanentFetchError(
-            f"{label}: access denied (HTTP 403) although the session is valid"
-        ) from error
+        raise PermanentFetchError(f"{label}: access denied (HTTP 403) although the session is valid") from error
     # False alarm or the site is down: pause, then try again
-    sleep_and_log(seconds=backoff_seconds)
+    sleep_unless_session_aborted(seconds=backoff_seconds)
 
 
 # The ONE retry loop every download uses
-def run_with_retries(
-    *, browser_context: BrowserContext, label: str, attempt_function: AttemptFunction
-) -> Any:
+def run_with_retries(*, browser_context: BrowserContext, label: str, attempt_function: AttemptFunction) -> Any:
     # The most recent problem, for the final message
     last_problem = "unknown problem"
     # Normal attempts made so far
@@ -2274,9 +2242,7 @@ def run_with_retries(
         # Catch every kind of problem
         try:
             # Do the actual work
-            result = attempt_function(
-                attempt_label=f"{label} (try {attempt_number}/{RETRY_ATTEMPTS})"
-            )
+            result = attempt_function(attempt_label=f"{label} (try {attempt_number}/{RETRY_ATTEMPTS})")
             # The server is happy, so move the delay back towards normal
             request_delay.decrease()
             # Everything is fine
@@ -2289,10 +2255,7 @@ def run_with_retries(
             logger.warning(f"{label}: {error}")
             # Restarts the browser if we are logged out, otherwise pauses
             handle_login_problem(
-                browser_context=browser_context,
-                label=label,
-                error=error,
-                backoff_seconds=backoff_seconds,
+                browser_context=browser_context, label=label, error=error, backoff_seconds=backoff_seconds
             )
             # Try again (the pause was already made)
             continue
@@ -2301,11 +2264,7 @@ def run_with_retries(
             # Remember the problem
             last_problem = str(error)
             # Prefer the server's wait time
-            backoff_seconds = (
-                error.wait_seconds
-                if error.wait_seconds is not None
-                else backoff_seconds
-            )
+            backoff_seconds = error.wait_seconds if error.wait_seconds is not None else backoff_seconds
             # Be gentler to the server from now on
             request_delay.increase()
             # Tell the user
@@ -2329,20 +2288,14 @@ def run_with_retries(
         # Only wait if another attempt follows
         if attempt_number < RETRY_ATTEMPTS:
             # Wait before trying again
-            sleep_and_log(seconds=backoff_seconds)
+            sleep_unless_session_aborted(seconds=backoff_seconds)
     # All attempts failed
-    raise PermanentFetchError(
-        f"{label}: gave up after {RETRY_ATTEMPTS} tries ({last_problem})"
-    )
+    raise PermanentFetchError(f"{label}: gave up after {RETRY_ATTEMPTS} tries ({last_problem})")
 
 
 # Visit a page in Chrome safely (status check, content check and retries)
 def fetch_page_with_retries(
-    *,
-    browser_context: BrowserContext,
-    url: str,
-    label: str,
-    validate_page: PageValidator,
+    *, browser_context: BrowserContext, url: str, label: str, validate_page: PageValidator
 ) -> tuple[str, bytes]:
     # One attempt
     def attempt(*, attempt_label: str) -> tuple[str, bytes]:
@@ -2352,10 +2305,7 @@ def fetch_page_with_retries(
         )
         # Check the status code
         check_http_status(
-            status_code=response.status,
-            status_text=response.status_text,
-            headers=response.headers,
-            label=label,
+            status_code=response.status, status_text=response.status_text, headers=response.headers, label=label
         )
         # Check the content is what we expected
         validate_page(page_body=page_body)
@@ -2363,15 +2313,11 @@ def fetch_page_with_retries(
         return final_url, page_body
 
     # Run it with all the retry rules
-    return run_with_retries(
-        browser_context=browser_context, label=label, attempt_function=attempt
-    )
+    return run_with_retries(browser_context=browser_context, label=label, attempt_function=attempt)
 
 
 # Wait until the site is up and we are logged in
-def wait_for_site_recovery(
-    *, browser_context: BrowserContext, wait_seconds: float
-) -> None:
+def wait_for_site_recovery(*, browser_context: BrowserContext, wait_seconds: float) -> None:
     # Site checks that failed in a row
     failed_checks = 0
     # Until the site is healthy again
@@ -2394,61 +2340,59 @@ def wait_for_site_recovery(
         # Waiting with an open Chrome does not help
         if failed_checks >= SITE_DOWN_RESTART_AFTER_CHECKS:
             # The main loop closes Chrome, waits for ping replies, then starts again
-            raise NetworkDownError(
-                "the site does not answer; closing Chrome and waiting for the internet"
-            )
+            raise NetworkDownError("the site does not answer; closing Chrome and waiting for the internet")
         # The site is still down: wait longer
         wait_seconds = min(MAXIMUM_BACKOFF_SECONDS, wait_seconds * 2)
         # Tell the user
-        logger.error(
-            f"The site still does not answer properly; waiting {wait_seconds}s"
-        )
+        logger.error(f"The site still does not answer properly; waiting {wait_seconds}s")
 
 
-# Pause the run when many documents fail in a row
-def apply_circuit_breaker(
-    *, browser_context: BrowserContext, document_ok: bool
-) -> None:
+# Pause the run when many documents fail in a row (safe to call from several worker threads)
+def apply_circuit_breaker(*, browser_context: BrowserContext, document_ok: bool) -> None:
     # A success resets everything
     if document_ok:
-        # No streak
-        run_state.consecutive_document_failures = 0
-        # The next trip starts with a short pause again
-        run_state.circuit_breaker_trips = 0
+        # Only one thread at a time may change the counters
+        with state_lock:
+            # No streak
+            run_state.consecutive_document_failures = 0
+            # The next trip starts with a short pause again
+            run_state.circuit_breaker_trips = 0
         return
+    # Count one more failure in a row and remember the new streak length
+    with state_lock:
+        run_state.consecutive_document_failures += 1
+        failure_streak = run_state.consecutive_document_failures
     # Show how close the breaker is to tripping
-    logger.debug(
-        "Failure streak: %d/%d",
-        run_state.consecutive_document_failures + 1,
-        CIRCUIT_BREAKER_FAILURES,
-    )
-    # One more failure in a row
-    run_state.consecutive_document_failures += 1
+    logger.debug("Failure streak: %d/%d", failure_streak, CIRCUIT_BREAKER_FAILURES)
     # Two failures in a row: check early whether the website logged us out
-    if run_state.consecutive_document_failures == CIRCUIT_BREAKER_LOGIN_CHECK_AT:
+    if failure_streak == CIRCUIT_BREAKER_LOGIN_CHECK_AT:
         # Restart Chrome if we are logged out
-        raise_if_logged_out(
-            browser_context=browser_context, label="documents keep failing"
-        )
+        raise_if_logged_out(browser_context=browser_context, label="documents keep failing")
     # Not enough failures yet
-    if run_state.consecutive_document_failures < CIRCUIT_BREAKER_FAILURES:
+    if failure_streak < CIRCUIT_BREAKER_FAILURES:
         return
-    # Count this trip
-    run_state.circuit_breaker_trips += 1
-    # Longer pause with every trip
-    wait_seconds = min(
-        MAXIMUM_BACKOFF_SECONDS,
-        CIRCUIT_BREAKER_BASE_SECONDS * 2 ** (run_state.circuit_breaker_trips - 1),
-    )
-    # Explain
-    logger.error(
-        f"{run_state.consecutive_document_failures} documents in a row failed "
-        f"(site down, throttling or session lost?). Pausing {wait_seconds}s"
-    )
-    # Wait until the site is healthy (restarts Chrome if logged out)
-    wait_for_site_recovery(browser_context=browser_context, wait_seconds=wait_seconds)
-    # Start counting again
-    run_state.consecutive_document_failures = 0
+    # Only one worker pauses; the other workers wait for it at the start of their next document
+    with circuit_breaker_lock:
+        # Count this trip (unless another worker already paused and reset the streak)
+        with state_lock:
+            # Another worker already handled this streak
+            if run_state.consecutive_document_failures < CIRCUIT_BREAKER_FAILURES:
+                return
+            # Count this trip
+            run_state.circuit_breaker_trips += 1
+            trip_number = run_state.circuit_breaker_trips
+            streak_now = run_state.consecutive_document_failures
+        # Longer pause with every trip
+        wait_seconds = min(MAXIMUM_BACKOFF_SECONDS, CIRCUIT_BREAKER_BASE_SECONDS * 2 ** (trip_number - 1))
+        # Explain
+        logger.error(
+            f"{streak_now} documents in a row failed (site down, throttling or session lost?). Pausing {wait_seconds}s"
+        )
+        # Wait until the site is healthy (restarts Chrome if logged out)
+        wait_for_site_recovery(browser_context=browser_context, wait_seconds=wait_seconds)
+        # Start counting again
+        with state_lock:
+            run_state.consecutive_document_failures = 0
     # Tell the user
     logger.info("Resuming after the pause")
 
@@ -2524,69 +2468,206 @@ def trigger_chrome_download(*, download_tab: Page, url: str, label: str) -> Down
     return download
 
 
-# Let CHROME download one PDF to a temporary file
+# A download got 403/404/410 (or Chrome said "canceled"): decide whether the file is really refused (always raises)
+def confirm_download_was_refused(*, browser_context: BrowserContext, label: str, reason: str) -> None:
+    # A dead browser is not a refusal
+    raise_if_browser_unusable()
+    # Is the site up and are we logged in?
+    site_state = check_site_state(browser_context=browser_context)
+    # The session ended, so the file was not really refused
+    if site_state == SITE_LOGGED_OUT:
+        # Log in again and retry
+        raise SessionExpiredError(f"{label}: the download failed because the session ended")
+    # The site is not answering, so the file was not really refused
+    if site_state == SITE_DOWN:
+        # Retry later
+        raise RetryableFetchError(f"{label}: the download failed while the site was down")
+    # The site is fine, so the file really is refused
+    raise RefusedDownloadError(f"{label}: the server refused the download ({reason})")
+
+
+# Download one file INSIDE Chrome with a hard timeout and write it to partial_path (raises on every kind of failure)
+def download_pdf_by_fetch(
+    *, browser_context: BrowserContext, download_tab: Page, url: str, label: str, partial_path: Path
+) -> None:
+    # Chrome downloads the whole file; the JavaScript timer guarantees that this call always ends
+    fetch_result = download_tab.evaluate(
+        expression=FETCH_PDF_JAVASCRIPT, arg={"url": url, "timeoutMs": DOWNLOAD_TIMEOUT_MS}
+    )
+    # Whatever happens next, the bytes must not stay in the page's memory
+    try:
+        # The HTTP status code the server answered with
+        status_code = int(fetch_result.get("status", 0))
+        # The file is really refused (after checking that it is not just a logout or a site problem)
+        if status_code in (403, 404, 410):
+            # Always raises
+            confirm_download_was_refused(browser_context=browser_context, label=label, reason=f"HTTP {status_code}")
+        # Turn every other bad status into the right error (401 logout, 429/5xx retry, ...)
+        check_http_status(
+            status_code=status_code,
+            status_text=str(fetch_result.get("statusText", "")),
+            headers={RETRY_AFTER_HEADER_NAME: str(fetch_result.get("retryAfter", ""))},
+            label=label,
+        )
+        # How many bytes Chrome received
+        total_bytes = int(fetch_result.get("size", 0))
+        # How many bytes the server announced
+        announced_length = str(fetch_result.get("contentLength", ""))
+        # With compression the announced length is the compressed size, so only compare uncompressed answers
+        if announced_length.isdigit() and not fetch_result.get("contentEncoding") and int(announced_length) != total_bytes:
+            # The connection ended early: download it again
+            raise RetryableFetchError(
+                f"{label}: incomplete download ({total_bytes} of {announced_length} bytes received)"
+            )
+        # Write the temporary file piece by piece
+        with partial_path.open(mode="wb") as partial_file:
+            # Where the next piece starts
+            offset = 0
+            # Until every byte was moved
+            while offset < total_bytes:
+                # The size of this piece
+                chunk_length = min(DOWNLOAD_CHUNK_BYTES, total_bytes - offset)
+                # Ask Chrome for the piece (base64 text)
+                encoded_chunk = download_tab.evaluate(expression=READ_PDF_CHUNK_JAVASCRIPT, arg=[offset, chunk_length])
+                # The page lost the bytes (for example because it reloaded)
+                if not isinstance(encoded_chunk, str):
+                    raise RetryableFetchError(f"{label}: Chrome lost the downloaded bytes at offset {offset}")
+                # Decode the piece
+                chunk = base64.b64decode(encoded_chunk)
+                # A piece of the wrong size means something went wrong in between
+                if len(chunk) != chunk_length:
+                    raise RetryableFetchError(f"{label}: a piece of the file arrived with the wrong size")
+                # Save the piece
+                partial_file.write(chunk)
+                # Move on
+                offset += chunk_length
+    # Always runs
+    finally:
+        # Free the memory in the page (the page may be gone already)
+        try:
+            # Remove the bytes
+            download_tab.evaluate(expression=DISCARD_PDF_JAVASCRIPT)
+        # The tab or the browser is gone
+        except PlaywrightError:
+            pass
+
+
+# Download one file with Chrome's own download event and save it to partial_path (the "click" method)
+def download_pdf_by_clicking(
+    *, browser_context: BrowserContext, download_tab: Page, url: str, label: str, partial_path: Path
+) -> None:
+    # Chrome reports "canceled" for 403, 404 and 500 alike
+    try:
+        # Let Chrome download the file
+        download = trigger_chrome_download(download_tab=download_tab, url=url, label=label)
+    # Is this a real refusal, or a side effect of something else?
+    except RefusedDownloadError:
+        # Always raises
+        confirm_download_was_refused(browser_context=browser_context, label=label, reason="Chrome reported 'canceled'")
+    # Copy Chrome's temporary download to our temporary file
+    download.save_as(path=str(partial_path))
+
+
+# Reload the document page and return the current download link of one file (the old link if it cannot be found)
+def find_fresh_download_url(
+    *, download_tab: Page, document_page_url: str, file_number: str, fallback_url: str, label: str
+) -> str:
+    # Loading and parsing can fail
+    try:
+        # Reload the document page, which also refreshes the session
+        download_tab.goto(url=document_page_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_MS)
+        # Read all PDF links of the freshly loaded page
+        fresh_links = parse_document_page(html_text=download_tab.content(), page_url=download_tab.url)
+    # Browser or parsing problem
+    except (PlaywrightError, etree.LxmlError, ValueError) as error:
+        # A dead Chrome must restart
+        restart_browser_if_error_is_fatal(error)
+        # Explain and carry on with the old link
+        logger.warning(f"{label}: could not get a fresh download link ({error}); using the old link")
+        return fallback_url
+    # Every link of the page
+    for fresh_link in fresh_links:
+        # The same file as before
+        if fresh_link["file_number"] == file_number:
+            # Tell the user when the link really changed
+            if fresh_link["download_url"] != fallback_url:
+                logger.info(f"{label}: using a fresh download link")
+            # The current link of this file
+            return fresh_link["download_url"]
+    # The file is not listed any more
+    logger.warning(f"{label}: file {file_number} is not on the document page any more; using the old link")
+    return fallback_url
+
+
+# Let CHROME download one PDF to a temporary file; failed and incomplete downloads are downloaded again
 def download_pdf_with_retries(
     *,
     browser_context: BrowserContext,
     url: str,
+    file_number: str,
     label: str,
     document_page_url: str,
     partial_path: Path,
 ) -> DownloadedPdf:
+    # How many downloads without the %%EOF end marker were thrown away and downloaded again
+    incomplete_downloads = 0
+    # How many attempts have started (the first one uses the link from the document page as it was read)
+    attempts_started = 0
+
     # One attempt
     def attempt(*, attempt_label: str) -> DownloadedPdf:
-        # The dedicated tab
+        # These variables live in the enclosing function (url is replaced by a fresh link on every retry)
+        nonlocal incomplete_downloads, attempts_started, url
+        # The calling thread's own tab
         download_tab = get_download_tab(browser_context=browser_context)
-        # The link must be clicked on the document page itself
+        # The download must start on the document page itself
         if download_tab.url != document_page_url:
             # Report it
-            logger.debug(
-                "%s: going back to the document page %s",
-                attempt_label,
-                document_page_url,
-            )
+            logger.debug("%s: going back to the document page %s", attempt_label, document_page_url)
             # Go back to the document page
-            download_tab.goto(
-                url=document_page_url,
-                wait_until="domcontentloaded",
-                timeout=REQUEST_TIMEOUT_MS,
+            download_tab.goto(url=document_page_url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_MS)
+        # Count this attempt
+        attempts_started += 1
+        # Download links can expire, so every attempt after the first looks up the current link first
+        if attempts_started > 1:
+            # Reload the document page and read the link of this file again
+            url = find_fresh_download_url(
+                download_tab=download_tab,
+                document_page_url=document_page_url,
+                file_number=file_number,
+                fallback_url=url,
+                label=attempt_label,
             )
         # Make sure there is room (waits instead of stopping)
         wait_for_free_disk_space()
         # Make sure the folder exists
         partial_path.parent.mkdir(parents=True, exist_ok=True)
+        # Leftovers of a failed attempt must never be mistaken for new data
+        delete_file_quietly(file_path=partial_path)
         # Log the address
-        logger.info(f"{attempt_label}: Chrome is downloading {url}")
+        logger.info(f"{attempt_label}: Chrome is downloading {url} (method: {DOWNLOAD_METHOD})")
         # Remember when the download started
         started_at = time.monotonic()
-        # Chrome reports "canceled" for 403, 404 and 500 alike
-        try:
-            # Let Chrome download the file
-            download = trigger_chrome_download(
-                download_tab=download_tab, url=url, label=label
+        # The chosen download method
+        if DOWNLOAD_METHOD == "click":
+            # Chrome's own download event
+            download_pdf_by_clicking(
+                browser_context=browser_context,
+                download_tab=download_tab,
+                url=url,
+                label=label,
+                partial_path=partial_path,
             )
-        # Is this a real refusal, or a side effect of something else?
-        except RefusedDownloadError:
-            # A dead browser is not a refusal
-            raise_if_browser_unusable()
-            # Is the site up and are we logged in?
-            site_state = check_site_state(browser_context=browser_context)
-            # The session ended, so the file was not really refused
-            if site_state == SITE_LOGGED_OUT:
-                # Log in again and retry
-                raise SessionExpiredError(
-                    f"{label}: the download was canceled because the session ended"
-                )
-            # The site is not answering, so the file was not really refused
-            if site_state == SITE_DOWN:
-                # Retry later
-                raise RetryableFetchError(
-                    f"{label}: the download was canceled while the site was down"
-                )
-            # The site is fine, so the file really is refused
-            raise
-        # Copy Chrome's temporary download to our temporary file
-        download.save_as(path=str(partial_path))
+        # The recommended method
+        else:
+            # Download inside Chrome with a hard timeout
+            download_pdf_by_fetch(
+                browser_context=browser_context,
+                download_tab=download_tab,
+                url=url,
+                label=label,
+                partial_path=partial_path,
+            )
         # A rejected file must never stay behind
         try:
             # Check it really is a PDF
@@ -2597,6 +2678,17 @@ def download_pdf_with_retries(
             delete_file_quietly(file_path=partial_path)
             # Pass the problem on
             raise
+        # A complete PDF ends with %%EOF; a file without it is probably cut off, so it is downloaded again
+        if not downloaded_pdf.has_end_marker and incomplete_downloads < INCOMPLETE_DOWNLOAD_REDOWNLOADS:
+            # Count this thrown-away download
+            incomplete_downloads += 1
+            # Remove the incomplete-looking file
+            delete_file_quietly(file_path=partial_path)
+            # Download it again (the last attempt accepts the file and saves it as suspect)
+            raise RetryableFetchError(
+                f"{attempt_label}: the PDF has no %%EOF end marker, so it looks incomplete "
+                f"(download {incomplete_downloads}/{INCOMPLETE_DOWNLOAD_REDOWNLOADS}); downloading it again"
+            )
         # Log size and duration
         logger.info(
             f"{attempt_label}: Chrome saved {downloaded_pdf.size_bytes} bytes in {time.monotonic() - started_at:.1f}s"
@@ -2605,9 +2697,7 @@ def download_pdf_with_retries(
         return downloaded_pdf
 
     # Run it with all the retry rules
-    return run_with_retries(
-        browser_context=browser_context, label=label, attempt_function=attempt
-    )
+    return run_with_retries(browser_context=browser_context, label=label, attempt_function=attempt)
 
 
 # ===========================================================================
@@ -2621,10 +2711,14 @@ def accept_browser_dialog(dialog: Dialog) -> None:
         logger.info(f"Browser alert accepted: {dialog.message[:100]!r}")
         # Click OK
         dialog.accept()
-    # The dialog was already gone
+    # The dialog was already gone, or the main thread's connection answered it first
     except PlaywrightError as error:
-        # Log and carry on
-        logger.warning(f"Could not answer a browser alert: {error}")
+        # Several connections watch the same tab, so "already handled" is normal and only logged quietly
+        if "already handled" in str(error).lower():
+            logger.debug(f"The browser alert was already answered: {error}")
+        # Anything else is worth a warning
+        else:
+            logger.warning(f"Could not answer a browser alert: {error}")
 
 
 # Make Chrome believe it closed cleanly and forget the old tabs, so it never restores them
@@ -2657,6 +2751,16 @@ def clear_chrome_restore_state() -> None:
         logger.warning(f"Could not reset Chrome's restore state: {error}")
 
 
+# Ask the operating system for a free local TCP port
+def find_free_local_port() -> int:
+    # A throw-away socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+        # Port 0 means "any free port"
+        probe_socket.bind((REMOTE_DEBUGGING_HOST, 0))
+        # The port the operating system chose
+        return probe_socket.getsockname()[1]
+
+
 # Launch and configure the browser
 def launch_browser(*, playwright_instance: Playwright) -> BrowserContext:
     # Create the browser profile folder
@@ -2665,6 +2769,8 @@ def launch_browser(*, playwright_instance: Playwright) -> BrowserContext:
     clear_chrome_restore_state()
     # Report the launch
     logger.info(f"Launching Chromium with profile {BROWSER_PROFILE_FOLDER}")
+    # The port on which the worker threads connect to this same Chrome
+    run_state.remote_debugging_port = find_free_local_port()
     # The browser may not be installed
     try:
         # Launch the persistent browser (visible, maximized, password manager on)
@@ -2673,7 +2779,7 @@ def launch_browser(*, playwright_instance: Playwright) -> BrowserContext:
             headless=not SHOW_BROWSER_WINDOW,
             accept_downloads=True,
             no_viewport=True,
-            args=BROWSER_LAUNCH_ARGUMENTS,
+            args=[*BROWSER_LAUNCH_ARGUMENTS, f"--remote-debugging-port={run_state.remote_debugging_port}"],
             ignore_default_args=BROWSER_IGNORED_DEFAULT_ARGUMENTS,
         )
     # Chromium could not start
@@ -2711,8 +2817,6 @@ def launch_browser(*, playwright_instance: Playwright) -> BrowserContext:
         run_state.clear_cookies_on_next_start = False
     # Only close events of THIS context count from now on
     run_state.active_browser_context = browser_context
-    # The download tab of the old session is gone
-    run_state.download_tab = None
     # Every page of the site keeps the session alive (it never clicks Logout)
     browser_context.add_init_script(script=KEEP_ALIVE_JAVASCRIPT)
     # Find out the moment Chrome dies
@@ -2728,9 +2832,7 @@ def launch_browser(*, playwright_instance: Playwright) -> BrowserContext:
     # Log all requests and responses of this browser
     attach_network_logging(browser_context)
     # Tell the user
-    logger.info(
-        "Browser started; logging all requests, responses, console output and downloads"
-    )
+    logger.info("Browser started; logging all requests, responses, console output and downloads")
     # Hand the browser back
     return browser_context
 
@@ -2767,9 +2869,7 @@ def start_keyboard_reader() -> None:
     # Remember that the thread now exists
     keyboard_reader_state["started"] = True
     # Daemon: never blocks the exit
-    threading.Thread(
-        target=read_keyboard_lines, name="keyboard-reader", daemon=True
-    ).start()
+    threading.Thread(target=read_keyboard_lines, name="keyboard-reader", daemon=True).start()
 
 
 # Let Playwright process events for a short moment
@@ -2820,9 +2920,7 @@ def wait_for_user_enter(*, tab: Page, message: str) -> None:
         # The terminal input has ended, so nobody can press Enter
         if keyboard_reader_state["closed"]:
             # Explain
-            logger.warning(
-                f"Terminal input is closed; continuing automatically in {CLOSED_INPUT_WAIT_SECONDS}s"
-            )
+            logger.warning(f"Terminal input is closed; continuing automatically in {CLOSED_INPUT_WAIT_SECONDS}s")
             # Give the browser some time
             sleep_and_log(seconds=CLOSED_INPUT_WAIT_SECONDS)
             # Continue as if Enter was pressed
@@ -2895,10 +2993,7 @@ def try_automatic_login(*, tab: Page) -> bool:
     # Moment to stop waiting for the autofill
     deadline = time.monotonic() + AUTO_LOGIN_WAIT_SECONDS
     # Report the wait
-    logger.debug(
-        "Waiting up to %ss for Chrome to autofill the saved password",
-        AUTO_LOGIN_WAIT_SECONDS,
-    )
+    logger.debug("Waiting up to %ss for Chrome to autofill the saved password", AUTO_LOGIN_WAIT_SECONDS)
     # Wait for Chrome to fill the form
     while not is_password_autofilled(tab=tab):
         # Chrome did not fill anything in time
@@ -2918,13 +3013,9 @@ def try_automatic_login(*, tab: Page) -> bool:
         # A real click lets Chrome release the autofilled password to the page
         tab.click(selector=PASSWORD_FIELD_SELECTOR, timeout=AUTO_STEP_TIMEOUT_MS)
         # Press Enter to submit the form
-        tab.press(
-            selector=PASSWORD_FIELD_SELECTOR, key="Enter", timeout=AUTO_STEP_TIMEOUT_MS
-        )
+        tab.press(selector=PASSWORD_FIELD_SELECTOR, key="Enter", timeout=AUTO_STEP_TIMEOUT_MS)
         # Wait until the log-in form is gone
-        tab.wait_for_function(
-            expression=LOGIN_DONE_JAVASCRIPT, timeout=AUTO_STEP_TIMEOUT_MS
-        )
+        tab.wait_for_function(expression=LOGIN_DONE_JAVASCRIPT, timeout=AUTO_STEP_TIMEOUT_MS)
     # Click, key press or wait failed
     except PlaywrightError as error:
         # A dead Chrome must restart
@@ -2943,11 +3034,7 @@ def run_advanced_search(*, browser_context: BrowserContext, tab: Page) -> Page |
     # The page may not load
     try:
         # Open the search page
-        tab.goto(
-            url=SEARCH_PAGE_URL,
-            wait_until="domcontentloaded",
-            timeout=REQUEST_TIMEOUT_MS,
-        )
+        tab.goto(url=SEARCH_PAGE_URL, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_MS)
     # The page did not load
     except PlaywrightError as error:
         # A dead Chrome must restart
@@ -2961,9 +3048,7 @@ def run_advanced_search(*, browser_context: BrowserContext, tab: Page) -> Page |
         # The control may not exist
         try:
             # Click the control with this text
-            tab.get_by_text(step_pattern).first.click(
-                timeout=AUTO_OPTIONAL_CLICK_TIMEOUT_MS
-            )
+            tab.get_by_text(step_pattern).first.click(timeout=AUTO_OPTIONAL_CLICK_TIMEOUT_MS)
             # Tell the user
             logger.info(f"Clicked '{step_pattern.pattern}'")
         # The control was not found or not clickable
@@ -2973,17 +3058,13 @@ def run_advanced_search(*, browser_context: BrowserContext, tab: Page) -> Page |
     # The Search button may not be found by its role
     try:
         # Click the Search button
-        tab.get_by_role("button", name=SEARCH_BUTTON_PATTERN).first.click(
-            timeout=AUTO_STEP_TIMEOUT_MS
-        )
+        tab.get_by_role("button", name=SEARCH_BUTTON_PATTERN).first.click(timeout=AUTO_STEP_TIMEOUT_MS)
     # Not found that way
     except PlaywrightError:
         # Try the backup selector
         try:
             # Click the Search button
-            tab.locator(selector=SEARCH_BUTTON_FALLBACK_SELECTOR).first.click(
-                timeout=AUTO_STEP_TIMEOUT_MS
-            )
+            tab.locator(selector=SEARCH_BUTTON_FALLBACK_SELECTOR).first.click(timeout=AUTO_STEP_TIMEOUT_MS)
         # Not found at all
         except PlaywrightError as error:
             # A dead Chrome must restart
@@ -3030,9 +3111,7 @@ def open_results_grid(*, browser_context: BrowserContext) -> Page:
     # Logged in without help from the user
     if try_automatic_login(tab=first_tab):
         # Search automatically
-        results_tab = run_advanced_search(
-            browser_context=browser_context, tab=first_tab
-        )
+        results_tab = run_advanced_search(browser_context=browser_context, tab=first_tab)
         # The results grid is showing
         if results_tab is not None:
             # Log the success
@@ -3060,9 +3139,7 @@ def open_results_grid(*, browser_context: BrowserContext) -> Page:
             return results_tab
         # Does any open tab show the logout link?
         logged_in = any(
-            tab_shows_logout_link(tab=open_tab)
-            for open_tab in browser_context.pages
-            if not open_tab.is_closed()
+            tab_shows_logout_link(tab=open_tab) for open_tab in browser_context.pages if not open_tab.is_closed()
         )
         # Ask for the right next step
         prompt_message = NO_RESULTS_REMINDER if logged_in else NOT_LOGGED_IN_REMINDER
@@ -3076,9 +3153,7 @@ def read_page_numbers(*, tab: Page) -> tuple[int | None, int | None]:
     # The label can be missing or slow
     try:
         # The label text
-        label_text = (
-            tab.locator(selector=PAGE_LABEL_SELECTOR).text_content(timeout=10_000) or ""
-        )
+        label_text = tab.locator(selector=PAGE_LABEL_SELECTOR).text_content(timeout=10_000) or ""
     # The label could not be read
     except PlaywrightError as error:
         # A dead Chrome must restart
@@ -3086,9 +3161,7 @@ def read_page_numbers(*, tab: Page) -> tuple[int | None, int | None]:
         # Report "unknown"
         return None, None
     # Find the page numbers
-    match_found = PAGE_LABEL_PATTERN.search(
-        string=label_text.replace(NON_BREAKING_SPACE, " ")
-    )
+    match_found = PAGE_LABEL_PATTERN.search(string=label_text.replace(NON_BREAKING_SPACE, " "))
     # The text has an unexpected shape
     if not match_found:
         return None, None
@@ -3121,9 +3194,7 @@ def find_page_number_box(*, tab: Page) -> Locator | None:
             # It exists and a person could see it
             if candidate.count() > 0 and candidate.is_visible():
                 # Report which selector matched
-                logger.debug(
-                    "Found the 'go to page' box with selector %s", box_selector
-                )
+                logger.debug("Found the 'go to page' box with selector %s", box_selector)
                 return candidate
         # The page cannot be inspected
         except PlaywrightError as error:
@@ -3134,9 +3205,7 @@ def find_page_number_box(*, tab: Page) -> Locator | None:
 
 
 # Type a page number into the page box and press Enter; True if the grid shows that page now
-def jump_to_results_page(
-    *, browser_context: BrowserContext, tab: Page, target_page: int
-) -> bool:
+def jump_to_results_page(*, browser_context: BrowserContext, tab: Page, target_page: int) -> bool:
     # A jump already failed in this run: use the Next button instead
     if run_state.page_jump_unavailable:
         return False
@@ -3183,10 +3252,7 @@ def jump_to_results_page(
         if current_page_now == target_page:
             return True
         # A logged-out website is a likely reason: restart Chrome and log in again
-        raise_if_logged_out(
-            browser_context=browser_context,
-            label=f"jumping to results page {target_page}",
-        )
+        raise_if_logged_out(browser_context=browser_context, label=f"jumping to results page {target_page}")
         # Click Next for the rest of this run
         run_state.page_jump_unavailable = True
         # The caller clicks Next instead
@@ -3198,16 +3264,12 @@ def jump_to_results_page(
 
 
 # Click Next and wait until the label AND the grid changed (raises PagingFailedError after PAGING_MAXIMUM_ROUNDS failed rounds)
-def go_to_next_results_page(
-    *, browser_context: BrowserContext, tab: Page, next_page_number: int
-) -> None:
+def go_to_next_results_page(*, browser_context: BrowserContext, tab: Page, next_page_number: int) -> None:
     # First document of the old page, to prove the grid was replaced
     previous_internal_id = read_first_internal_id(tab=tab)
     # Report the move
     logger.debug(
-        "Going to results page %d (first document now: %r)",
-        next_page_number,
-        previous_internal_id,
+        "Going to results page %d (first document now: %r)", next_page_number, previous_internal_id
     )
     # Rounds of attempts
     round_number = 0
@@ -3225,16 +3287,11 @@ def go_to_next_results_page(
             # Clicking or waiting can time out
             try:
                 # Click the next page button
-                tab.click(
-                    selector=NEXT_PAGE_BUTTON_SELECTOR, timeout=REQUEST_TIMEOUT_MS
-                )
+                tab.click(selector=NEXT_PAGE_BUTTON_SELECTOR, timeout=REQUEST_TIMEOUT_MS)
                 # Wait for the label and the rows to change
                 tab.wait_for_function(
                     expression=PAGE_CHANGE_CHECK_JAVASCRIPT,
-                    arg={
-                        "pageNumber": next_page_number,
-                        "previousInternalId": previous_internal_id,
-                    },
+                    arg={"pageNumber": next_page_number, "previousInternalId": previous_internal_id},
                     timeout=REQUEST_TIMEOUT_MS,
                 )
                 # Success
@@ -3255,8 +3312,7 @@ def go_to_next_results_page(
                     return
                 # A logged-out website is the most likely reason: restart Chrome and log in again
                 raise_if_logged_out(
-                    browser_context=browser_context,
-                    label=f"paging to results page {next_page_number}",
+                    browser_context=browser_context, label=f"paging to results page {next_page_number}"
                 )
                 # Short pause before the next try
                 sleep_and_log(seconds=SECONDS_PER_RETRY_STEP * attempt_number)
@@ -3268,17 +3324,11 @@ def go_to_next_results_page(
                 "(did the site layout change?)"
             )
             # Remember it for the final summary
-            record_problem(
-                label=f"paging to results page {next_page_number}",
-                url=SEARCH_PAGE_URL,
-                reason=reason,
-            )
+            record_problem(label=f"paging to results page {next_page_number}", url=SEARCH_PAGE_URL, reason=reason)
             # The main loop restarts Chrome (and stops only after several restarts without progress)
             raise PagingFailedError(reason)
         # Longer pauses between rounds
-        wait_seconds = min(
-            MAXIMUM_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
-        )
+        wait_seconds = min(MAXIMUM_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number)
         # Explain
         logger.error(
             f"Paging to results page {next_page_number} keeps failing "
@@ -3289,9 +3339,7 @@ def go_to_next_results_page(
 
 
 # Read the documents of the current results page (a failed read is never returned as an empty page)
-def read_results_page_records(
-    *, browser_context: BrowserContext, tab: Page, page_number: int
-) -> list[DocumentRecord]:
+def read_results_page_records(*, browser_context: BrowserContext, tab: Page, page_number: int) -> list[DocumentRecord]:
     # Report the read
     logger.debug("Reading the documents of results page %d", page_number)
     # Several rounds
@@ -3306,9 +3354,7 @@ def read_results_page_records(
             # Reading and parsing can fail
             try:
                 # The HTML of the grid
-                grid_html = tab.locator(selector=RESULTS_GRID_SELECTOR).evaluate(
-                    expression=GET_OUTER_HTML_JAVASCRIPT
-                )
+                grid_html = tab.locator(selector=RESULTS_GRID_SELECTOR).evaluate(expression=GET_OUTER_HTML_JAVASCRIPT)
                 # Parse it into records
                 return parse_results_grid(html_text=grid_html)
             # Browser or parsing problem
@@ -3323,35 +3369,25 @@ def read_results_page_records(
                 # Wait before trying again
                 sleep_and_log(seconds=SECONDS_PER_RETRY_STEP * attempt_number)
         # A logged-out website empties the grid: restart Chrome and log in again
-        raise_if_logged_out(
-            browser_context=browser_context, label=f"reading results page {page_number}"
-        )
+        raise_if_logged_out(browser_context=browser_context, label=f"reading results page {page_number}")
         # Another round follows
         if round_number < PAGING_MAXIMUM_ROUNDS:
             # Longer pauses between rounds
-            wait_seconds = min(
-                MAXIMUM_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number
-            )
+            wait_seconds = min(MAXIMUM_BACKOFF_SECONDS, SECONDS_PER_RETRY_STEP * 2**round_number)
             # Explain
-            logger.error(
-                f"Results page {page_number} could not be read; trying again in {wait_seconds}s"
-            )
+            logger.error(f"Results page {page_number} could not be read; trying again in {wait_seconds}s")
             # Wait before the next round
             sleep_and_log(seconds=wait_seconds)
     # What went wrong
     reason = f"results page {page_number} could not be read in {PAGING_MAXIMUM_ROUNDS} rounds"
     # Remember it for the final summary
-    record_problem(
-        label=f"results page {page_number}", url=SEARCH_PAGE_URL, reason=reason
-    )
+    record_problem(label=f"results page {page_number}", url=SEARCH_PAGE_URL, reason=reason)
     # The main loop restarts Chrome instead of skipping the page
     raise PagingFailedError(reason)
 
 
 # Yield (page number, total pages, documents) for every results page, starting at the saved page if there is one
-def iterate_results_pages(
-    *, browser_context: BrowserContext, tab: Page
-) -> Iterator[tuple[int, int, list[DocumentRecord]]]:
+def iterate_results_pages(*, browser_context: BrowserContext, tab: Page) -> Iterator[tuple[int, int, list[DocumentRecord]]]:
     # The page the grid shows now
     current_page_number: int | None = None
     # The number of pages
@@ -3370,9 +3406,7 @@ def iterate_results_pages(
     # The counter could never be read (no Enter prompt: this must work unattended)
     else:
         # The main loop restarts Chrome
-        raise BrowserLostError(
-            "cannot read 'Page X of Y'; restarting Chrome and logging in again"
-        )
+        raise BrowserLostError("cannot read 'Page X of Y'; restarting Chrome and logging in again")
     # Log where we start
     logger.info(f"Starting at results page {current_page_number} of {total_page_count}")
     # The page where the last run stopped
@@ -3389,9 +3423,7 @@ def iterate_results_pages(
                 f"paging forward from page {current_page_number}"
             )
             # One step: type the page number and press Enter
-            if jump_to_results_page(
-                browser_context=browser_context, tab=tab, target_page=saved_page_number
-            ):
+            if jump_to_results_page(browser_context=browser_context, tab=tab, target_page=saved_page_number):
                 # The grid shows the saved page now
                 current_page_number = saved_page_number
                 # The site may have changed the page total
@@ -3404,18 +3436,14 @@ def iterate_results_pages(
             while current_page_number < saved_page_number:
                 # Click Next without reading any documents
                 go_to_next_results_page(
-                    browser_context=browser_context,
-                    tab=tab,
-                    next_page_number=current_page_number + 1,
+                    browser_context=browser_context, tab=tab, next_page_number=current_page_number + 1
                 )
                 # Count the page
                 current_page_number += 1
                 # Now and then
                 if current_page_number % PAGES_BETWEEN_SKIP_LOGS == 0:
                     # Show the progress
-                    logger.info(
-                        f"Paging forward: results page {current_page_number} of {total_page_count}"
-                    )
+                    logger.info(f"Paging forward: results page {current_page_number} of {total_page_count}")
                 # Wait briefly to be polite to the server
                 polite_pause()
         # The saved page does not exist any more
@@ -3444,11 +3472,7 @@ def iterate_results_pages(
             # End the generator
             return
         # Navigate to the next page
-        go_to_next_results_page(
-            browser_context=browser_context,
-            tab=tab,
-            next_page_number=current_page_number + 1,
-        )
+        go_to_next_results_page(browser_context=browser_context, tab=tab, next_page_number=current_page_number + 1)
         # Count the page
         current_page_number += 1
         # The site may have changed the page total
@@ -3464,24 +3488,26 @@ def iterate_results_pages(
 # ===========================================================================
 # PROBLEMS, TOTALS AND SUMMARIES
 # ===========================================================================
-# Count a problem and remember it in memory
+# Count a problem and remember it in memory (safe to call from several threads)
 def record_problem(*, label: str, url: str, reason: str) -> None:
-    # Count the problem
-    run_state.problem_count += 1
+    # Many error texts already start with the label, so remove it to avoid saying it twice
+    reason = reason.removeprefix(f"{label}: ")
     # Create a timestamp
     timestamp = datetime.now().strftime(LOG_DATE_FORMAT)
-    # Remember it for the final summary
-    run_state.recorded_problems.append(
-        ProblemRecord(timestamp=timestamp, label=label, url=url, reason=reason)
-    )
+    # The counter and the list are shared by all threads
+    with state_lock:
+        # Count the problem
+        run_state.problem_count += 1
+        # Remember whether this is the very first problem of the run
+        is_first_problem = run_state.problem_count == 1
+        # Remember it for the final summary
+        run_state.recorded_problems.append(ProblemRecord(timestamp=timestamp, label=label, url=url, reason=reason))
     # Log the problem
     logger.error(f"{label}: FAILED - {reason}")
     # The very first problem of the run
-    if run_state.problem_count == 1:
+    if is_first_problem:
         # Tell the user
-        logger.info(
-            "First problem recorded; every problem is listed again at the end of the run"
-        )
+        logger.info("First problem recorded; every problem is listed again at the end of the run")
 
 
 # Build the one-line summary of the running totals
@@ -3490,9 +3516,7 @@ def build_totals_summary() -> str:
     elapsed_seconds = time.monotonic() - run_state.started_at_monotonic
     # Average speed (a plain count during the first minute)
     documents_per_minute = (
-        run_state.documents_processed / (elapsed_seconds / 60)
-        if elapsed_seconds >= 60
-        else float(run_state.documents_processed)
+        run_state.documents_processed / (elapsed_seconds / 60) if elapsed_seconds >= 60 else float(run_state.documents_processed)
     )
     # Build the text
     return (
@@ -3541,15 +3565,10 @@ def log_problem_summary() -> None:
         f"{len(run_state.failing_documents)} documents still have problems"
     )
     # The most recent problems, sorted by label
-    shown_problems = sorted(
-        run_state.recorded_problems[-MAXIMUM_ITEMS_SHOWN:],
-        key=lambda problem: problem.label,
-    )
+    shown_problems = sorted(run_state.recorded_problems[-MAXIMUM_ITEMS_SHOWN:], key=lambda problem: problem.label)
     # Print each problem
     for problem in shown_problems:
-        logger.warning(
-            f"  {problem.timestamp} | {problem.label} | {problem.reason} | {problem.url}"
-        )
+        logger.warning(f"  {problem.timestamp} | {problem.label} | {problem.reason} | {problem.url}")
     # Problems not listed
     hidden_count = len(run_state.recorded_problems) - len(shown_problems)
     # The list was cut short
@@ -3566,14 +3585,10 @@ def log_change_summary() -> None:
         f"{len(run_state.updated_documents)} known IDs received new files"
     )
     # Each new ID
-    for internal_id, public_id in list(run_state.new_documents.items())[
-        :MAXIMUM_ITEMS_SHOWN
-    ]:
+    for internal_id, public_id in list(run_state.new_documents.items())[:MAXIMUM_ITEMS_SHOWN]:
         logger.info(f"  new ID {internal_id} ({public_id})")
     # Each known ID with new files
-    for internal_id, file_numbers in list(run_state.updated_documents.items())[
-        :MAXIMUM_ITEMS_SHOWN
-    ]:
+    for internal_id, file_numbers in list(run_state.updated_documents.items())[:MAXIMUM_ITEMS_SHOWN]:
         logger.info(f"  known ID {internal_id}: new files {', '.join(file_numbers)}")
 
 
@@ -3603,9 +3618,7 @@ def is_saved_pdf_valid(*, file_path: Path) -> bool:
 def find_files_by_number(*, document_folder: Path, pdf_link: PdfLink) -> list[Path]:
     # The file number as it is written in file names
     number_part = sanitize_name_part(
-        text=pdf_link["file_number"],
-        maximum_length=FILE_NUMBER_MAXIMUM_LENGTH,
-        fallback=FALLBACK_FILE_NUMBER,
+        text=pdf_link["file_number"], maximum_length=FILE_NUMBER_MAXIMUM_LENGTH, fallback=FALLBACK_FILE_NUMBER
     )
     # The folder may not exist or be unreadable
     try:
@@ -3613,9 +3626,7 @@ def find_files_by_number(*, document_folder: Path, pdf_link: PdfLink) -> list[Pa
         return sorted(
             [
                 *document_folder.glob(f"*_{number_part}{PDF_FILE_EXTENSION}"),
-                *document_folder.glob(
-                    f"*_{number_part}{SUSPECT_MARKER}{PDF_FILE_EXTENSION}"
-                ),
+                *document_folder.glob(f"*_{number_part}{SUSPECT_MARKER}{PDF_FILE_EXTENSION}"),
             ]
         )
     # The folder cannot be read
@@ -3626,12 +3637,7 @@ def find_files_by_number(*, document_folder: Path, pdf_link: PdfLink) -> list[Pa
 
 # Skip a PDF that is already saved (no request is made for it); True if it should be skipped
 def should_skip_existing_file(
-    *,
-    document_record: DocumentRecord,
-    pdf_link: PdfLink,
-    file_label: str,
-    target_path: Path,
-    suspect_path: Path,
+    *, document_record: DocumentRecord, pdf_link: PdfLink, file_label: str, target_path: Path, suspect_path: Path
 ) -> bool:
     # Where the database says the file is
     recorded_path = find_recorded_file_path(
@@ -3645,48 +3651,32 @@ def should_skip_existing_file(
         *find_files_by_number(document_folder=target_path.parent, pdf_link=pdf_link),
     ):
         # Show every file that is considered
-        logger.debug(
-            "%s: checking candidate %s (recorded path: %s)",
-            file_label,
-            candidate_path,
-            recorded_path,
-        )
+        logger.debug("%s: checking candidate %s (recorded path: %s)", file_label, candidate_path, recorded_path)
         # Nothing there
         if candidate_path is None or not candidate_path.exists():
             continue
         # The file is broken
         if not is_saved_pdf_valid(file_path=candidate_path):
             # Explain
-            logger.warning(
-                f"{file_label}: the existing file {candidate_path.name} looks broken, downloading it again"
-            )
+            logger.warning(f"{file_label}: the existing file {candidate_path.name} looks broken, downloading it again")
             # Try the next candidate
             continue
         # An incomplete-looking file that was never downloaded a second time
         if SUSPECT_MARKER in candidate_path.name and not was_suspect_file_retried(
-            internal_id=document_record["internal_id"],
-            file_number=pdf_link["file_number"],
+            internal_id=document_record["internal_id"], file_number=pdf_link["file_number"]
         ):
             # Explain
-            logger.info(
-                f"{file_label}: {candidate_path.name} looks incomplete, downloading it once more"
-            )
+            logger.info(f"{file_label}: {candidate_path.name} looks incomplete, downloading it once more")
             # Do not skip it
             continue
         # Log the skip
-        logger.info(
-            f"{file_label}: already downloaded ({candidate_path.name}), skipping"
-        )
+        logger.info(f"{file_label}: already downloaded ({candidate_path.name}), skipping")
         # Count it
-        run_state.pdfs_skipped += 1
+        add_to_counter(counter_name="pdfs_skipped")
         # The database does not know this file yet
         if recorded_path is None:
             # Add it
-            record_file_found_on_disk(
-                document_record=document_record,
-                pdf_link=pdf_link,
-                saved_path=candidate_path,
-            )
+            record_file_found_on_disk(document_record=document_record, pdf_link=pdf_link, saved_path=candidate_path)
         # Skip
         return True
     # Nothing usable on disk: download it
@@ -3700,21 +3690,13 @@ def record_save_failure(*, file_label: str, target_path: Path, error: OSError) -
         # The disk is full
         case errno.ENOSPC:
             # Remember it
-            record_problem(
-                label=file_label,
-                url=str(target_path),
-                reason="the disk was full (will be retried)",
-            )
+            record_problem(label=file_label, url=str(target_path), reason="the disk was full (will be retried)")
             # Wait until space was freed instead of stopping
             wait_for_free_disk_space()
         # Any other file problem
         case _:
             # Remember it
-            record_problem(
-                label=file_label,
-                url=str(target_path),
-                reason=f"could not save the file: {error}",
-            )
+            record_problem(label=file_label, url=str(target_path), reason=f"could not save the file: {error}")
 
 
 # Update the totals and the database after a PDF was saved
@@ -3731,13 +3713,11 @@ def register_saved_pdf(
     # The file looks incomplete
     if is_suspect:
         # Count it
-        run_state.suspect_pdf_count += 1
+        add_to_counter(counter_name="suspect_pdf_count")
         # Remember which file it is
         run_state.suspect_file_paths.append(str(final_path))
         # Warn
-        logger.warning(
-            f"{file_label}: no %%EOF end marker, the file may be incomplete; saved as {final_path.name}"
-        )
+        logger.warning(f"{file_label}: no %%EOF end marker, the file may be incomplete; saved as {final_path.name}")
         # It was downloaded now, so later runs do not download it again
         record_suspect_retry(document_record=document_record, pdf_link=pdf_link)
     # The file looks complete
@@ -3747,13 +3727,11 @@ def register_saved_pdf(
         # Remove an older incomplete-looking copy
         delete_file_quietly(file_path=build_suspect_path(target_path=final_path))
     # Log the success
-    logger.info(
-        f"{file_label}: SAVED -> {final_path} ({downloaded_pdf.size_bytes} bytes, sha256 {downloaded_pdf.sha256_hex[:12]})"
-    )
+    logger.info(f"{file_label}: SAVED -> {final_path} ({downloaded_pdf.size_bytes} bytes, sha256 {downloaded_pdf.sha256_hex[:12]})")
     # Count the file
-    run_state.pdfs_saved += 1
+    add_to_counter(counter_name="pdfs_saved")
     # Add to the byte counter
-    run_state.bytes_written += downloaded_pdf.size_bytes
+    add_to_counter(counter_name="bytes_written", amount=downloaded_pdf.size_bytes)
     # Remember it in the database
     record_saved_file(
         document_record=document_record,
@@ -3763,11 +3741,7 @@ def register_saved_pdf(
         is_suspect=is_suspect,
     )
     # Announce it if the ID was already known
-    announce_new_file(
-        document_record=document_record,
-        pdf_link=pdf_link,
-        document_is_new=document_is_new,
-    )
+    announce_new_file(document_record=document_record, pdf_link=pdf_link, document_is_new=document_is_new)
 
 
 # Download and save one PDF; True if it worked (or needs no work)
@@ -3782,9 +3756,7 @@ def download_one_pdf(
     document_is_new: bool,
 ) -> bool:
     # Final path
-    target_path = document_folder / build_file_name(
-        document_folder=document_folder, pdf_link=pdf_link
-    )
+    target_path = document_folder / build_file_name(document_folder=document_folder, pdf_link=pdf_link)
     # Path used if the file looks incomplete
     suspect_path = build_suspect_path(target_path=target_path)
     # Temporary file
@@ -3801,9 +3773,7 @@ def download_one_pdf(
     ):
         return True
     # The server refused this file recently: nothing to do, and no request was made
-    if was_file_refused_recently(
-        internal_id=document_record["internal_id"], file_number=pdf_link["file_number"]
-    ):
+    if was_file_refused_recently(internal_id=document_record["internal_id"], file_number=pdf_link["file_number"]):
         # Log the skip
         logger.info(
             f"{file_label}: the server refused this file within the last {REFUSED_RECHECK_HOURS} hours, not asking again"
@@ -3815,6 +3785,7 @@ def download_one_pdf(
         downloaded_pdf = download_pdf_with_retries(
             browser_context=browser_context,
             url=pdf_link["download_url"],
+            file_number=pdf_link["file_number"],
             label=file_label,
             document_page_url=document_page_url,
             partial_path=partial_path,
@@ -3832,13 +3803,9 @@ def download_one_pdf(
     # The server refused to send the file
     except RefusedDownloadError as error:
         # Remember it, so it is not requested again soon
-        record_refused_file(
-            document_record=document_record, pdf_link=pdf_link, reason=str(error)
-        )
+        record_refused_file(document_record=document_record, pdf_link=pdf_link, reason=str(error))
         # Remember it for the final summary
-        run_state.refused_file_labels.append(
-            f"{document_record['internal_id']}/{pdf_link['file_number']}"
-        )
+        run_state.refused_file_labels.append(f"{document_record['internal_id']}/{pdf_link['file_number']}")
         # Tell the user
         logger.warning(str(error))
         # Not a problem of this run: it is listed in the summary
@@ -3846,9 +3813,7 @@ def download_one_pdf(
     # The download failed for good
     except PermanentFetchError as error:
         # Remember it
-        record_problem(
-            label=file_label, url=pdf_link["download_url"], reason=str(error)
-        )
+        record_problem(label=file_label, url=pdf_link["download_url"], reason=str(error))
         # This file failed
         return False
     # Saving to disk failed
@@ -3862,11 +3827,7 @@ def download_one_pdf(
         # But a dead Chrome must restart instead of failing document after document
         restart_browser_if_error_is_fatal(error)
         # Remember it
-        record_problem(
-            label=file_label,
-            url=pdf_link["download_url"],
-            reason=f"unexpected error: {error!r}",
-        )
+        record_problem(label=file_label, url=pdf_link["download_url"], reason=f"unexpected error: {error!r}")
         # This file failed
         return False
     # Download and saving both worked
@@ -3895,10 +3856,7 @@ def download_one_pdf(
 
 # Let Chrome visit a document page and read its PDF links (None on failure)
 def load_pdf_links(
-    *,
-    browser_context: BrowserContext,
-    document_record: DocumentRecord,
-    document_label: str,
+    *, browser_context: BrowserContext, document_record: DocumentRecord, document_label: str
 ) -> tuple[str, list[PdfLink]] | None:
     # Address of the document page
     page_request_url = DOCUMENT_PAGE_URL_TEMPLATE.format(document_record["internal_id"])
@@ -3927,9 +3885,7 @@ def load_pdf_links(
     except (etree.LxmlError, ValueError) as error:
         # Remember it
         record_problem(
-            label=document_label,
-            url=final_page_url,
-            reason=f"could not parse the document page: {error}",
+            label=document_label, url=final_page_url, reason=f"could not parse the document page: {error}"
         )
         # The document failed
         return None
@@ -3937,21 +3893,15 @@ def load_pdf_links(
 
 # Check one ID: read its page, download only the files not saved yet; True if everything worked
 def process_document_files(
-    *,
-    browser_context: BrowserContext,
-    document_record: DocumentRecord,
-    document_label: str,
-    count_document: bool,
+    *, browser_context: BrowserContext, document_record: DocumentRecord, document_label: str, count_document: bool
 ) -> bool:
     # Retries of a failed document are not counted again
     if count_document:
         # Count this document
-        run_state.documents_processed += 1
+        add_to_counter(counter_name="documents_processed")
     # The document page and its links (one request)
     loaded_page = load_pdf_links(
-        browser_context=browser_context,
-        document_record=document_record,
-        document_label=document_label,
+        browser_context=browser_context, document_record=document_record, document_label=document_label
     )
     # Loading failed: the document failed
     if loaded_page is None:
@@ -3961,16 +3911,9 @@ def process_document_files(
     # Internal document ID
     internal_id = document_record["internal_id"]
     # Did no earlier run see this ID?
-    document_is_new = internal_id in run_state.new_documents or not is_document_known(
-        internal_id=internal_id
-    )
+    document_is_new = internal_id in run_state.new_documents or not is_document_known(internal_id=internal_id)
     # Report the verdict
-    logger.debug(
-        "%s: document is new: %s, PDF links: %d",
-        document_label,
-        document_is_new,
-        len(pdf_links),
-    )
+    logger.debug("%s: document is new: %s, PDF links: %d", document_label, document_is_new, len(pdf_links))
     # A new ID
     if document_is_new:
         # Announce it
@@ -3978,7 +3921,7 @@ def process_document_files(
     # The page lists no PDF files
     if not pdf_links:
         # Count it
-        run_state.documents_without_pdfs += 1
+        add_to_counter(counter_name="documents_without_pdfs")
         # Log it
         logger.warning(f"{document_label}: no PDF links found on the document page")
         # Remember that it was checked
@@ -4006,20 +3949,14 @@ def process_document_files(
     # Every file is saved
     if document_ok:
         # Remember that the ID was checked now
-        record_document_checked(
-            document_record=document_record, pdf_count=len(pdf_links)
-        )
+        record_document_checked(document_record=document_record, pdf_count=len(pdf_links))
     # Report the result
     return document_ok
 
 
 # Check one document and sort it into "done" or "still failing"
 def process_document(
-    *,
-    browser_context: BrowserContext,
-    document_record: DocumentRecord,
-    document_label: str,
-    log_suffix: str,
+    *, browser_context: BrowserContext, document_record: DocumentRecord, document_label: str, log_suffix: str
 ) -> bool:
     # Internal document ID
     internal_id = document_record["internal_id"]
@@ -4027,6 +3964,10 @@ def process_document(
     log_label = document_label + log_suffix
     # A retry has a suffix
     is_retry = bool(log_suffix)
+    # Wait here while another worker is pausing for the circuit breaker
+    with circuit_breaker_lock:
+        # Nothing to do inside: only waiting for the lock matters
+        pass
     # Remember when this document started
     started_at = time.monotonic()
     # Announce the document
@@ -4056,154 +3997,362 @@ def process_document(
         )
         # This document failed
         document_ok = False
-    # Every file of the document worked
-    if document_ok:
-        # It failed earlier in this run
-        if internal_id in run_state.failing_documents:
-            # It is not a problem any more
-            del run_state.failing_documents[internal_id]
-            # Count the recovery
-            run_state.documents_recovered += 1
-    # Something went wrong
-    else:
-        # Earlier failure of the same document
-        previous_failure = run_state.failing_documents.get(internal_id)
-        # How often it failed now
-        attempts = previous_failure.attempts + 1 if previous_failure is not None else 1
-        # Remember it for the next retry round
-        run_state.failing_documents[internal_id] = FailingDocument(
-            record=document_record, label=document_label, attempts=attempts
-        )
+    # The dictionary is shared by all workers and read by the main thread, so it is only changed under the lock
+    with state_lock:
+        # Every file of the document worked
+        if document_ok:
+            # It failed earlier in this run
+            if internal_id in run_state.failing_documents:
+                # It is not a problem any more
+                del run_state.failing_documents[internal_id]
+                # Count the recovery
+                add_to_counter(counter_name="documents_recovered")
+        # Something went wrong
+        else:
+            # Earlier failure of the same document
+            previous_failure = run_state.failing_documents.get(internal_id)
+            # How often it failed now
+            attempts = previous_failure.attempts + 1 if previous_failure is not None else 1
+            # Remember it for the next retry round
+            run_state.failing_documents[internal_id] = FailingDocument(
+                record=document_record, label=document_label, attempts=attempts
+            )
     # Report the result and the duration
-    logger.info(
-        f"--- END {log_label}: {'OK' if document_ok else 'FAILED'} in {time.monotonic() - started_at:.1f}s ---"
-    )
+    logger.info(f"--- END {log_label}: {'OK' if document_ok else 'FAILED'} in {time.monotonic() - started_at:.1f}s ---")
     # Check for a logout after 2 failures in a row, pause after 5
     apply_circuit_breaker(browser_context=browser_context, document_ok=document_ok)
     # Report the result
     return document_ok
 
 
+# ===========================================================================
+# WORKER THREADS
+# ===========================================================================
+# One unit of work for a worker thread: check one document
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DocumentTask:
+    # The results-grid row of the document
+    record: DocumentRecord
+    # The original log label of the document
+    label: str
+    # Text added to the label in the log (empty for the first attempt, " (retry N)" for retries)
+    log_suffix: str
+
+
+# End the browser session for ALL threads; only the first error is kept
+def record_session_abort(*, error: BaseException) -> None:
+    # Only one thread at a time may change the error list
+    with state_lock:
+        # Keep the first (original) error only
+        if not session_abort_errors:
+            session_abort_errors.append(error)
+    # Tell every thread to stop
+    session_abort_event.set()
+
+
+# Close the calling thread's download tab without ever complaining
+def close_own_download_tab() -> None:
+    # The tab of this thread
+    own_tab = getattr(thread_local, "download_tab", None)
+    # This thread never opened one
+    if own_tab is None:
+        return
+    # Closing can fail
+    try:
+        # Close the tab
+        own_tab.close()
+    # The tab or the browser is already gone
+    except PlaywrightError:
+        pass
+
+
+# Connect this worker to the one shared Chrome (a few tries, because the debugging port may need a moment)
+def connect_to_shared_chrome(*, playwright_instance: Playwright) -> Any:
+    # The address of Chrome's local debugging port
+    endpoint_url = f"http://{REMOTE_DEBUGGING_HOST}:{run_state.remote_debugging_port}"
+    # Several tries
+    for attempt_number in range(1, WORKER_CONNECT_ATTEMPTS + 1):
+        # Another thread already ended the session
+        raise_if_browser_unusable()
+        # Connecting can fail
+        try:
+            # Connect to the browser that the main thread launched (no new browser, no new window)
+            return playwright_instance.chromium.connect_over_cdp(endpoint_url=endpoint_url)
+        # Chrome does not answer (yet)
+        except PlaywrightError as error:
+            # The last try failed: give up so the session restarts
+            if attempt_number == WORKER_CONNECT_ATTEMPTS:
+                raise BrowserLostError(f"a worker could not connect to Chrome at {endpoint_url}: {error}") from error
+            # Tell the user
+            logger.warning(f"Worker could not connect to Chrome (try {attempt_number}/{WORKER_CONNECT_ATTEMPTS}): {error}")
+            # Wait before the next try
+            sleep_and_log(seconds=SECONDS_PER_RETRY_STEP * attempt_number)
+    # Not reachable, but it keeps type checkers happy
+    raise BrowserLostError("a worker could not connect to Chrome")
+
+
+# The body of one worker thread: connect to the one Chrome, then check documents from the queue in an own tab
+def run_worker_thread(*, work_queue: queue.Queue) -> None:
+    # Any error that escapes ends the whole browser session
+    try:
+        # Playwright's sync API is bound to one thread, so every worker has its own Playwright connection
+        with sync_playwright() as playwright_instance:
+            # Connect to the one Chrome that the main thread launched (no new browser, no new window)
+            browser = connect_to_shared_chrome(playwright_instance=playwright_instance)
+            # Chrome has no usable window
+            if not browser.contexts:
+                raise BrowserLostError("the worker found no browser context in Chrome")
+            # The default context is the logged-in profile of the main thread, so cookies are shared
+            browser_context = browser.contexts[0]
+            # Keep the session alive in this worker's pages too (the script guards against running twice)
+            browser_context.add_init_script(script=KEEP_ALIVE_JAVASCRIPT)
+            # Report it
+            logger.info("Worker connected to the shared Chrome")
+            # Work until told to stop
+            try:
+                # Loop over the queued documents
+                while True:
+                    # Another thread ended the session
+                    if session_abort_event.is_set():
+                        return
+                    # Wait a short moment for the next task
+                    try:
+                        # Take the next task
+                        task = work_queue.get(timeout=QUEUE_POLL_SECONDS)
+                    # Nothing queued yet
+                    except queue.Empty:
+                        # Look again (and check the abort flag again)
+                        continue
+                    # Every task taken from the queue must be marked as done, even when it fails
+                    try:
+                        # None is the signal to stop
+                        if task is None:
+                            return
+                        # Check the document in this worker's own tab
+                        process_document(
+                            browser_context=browser_context,
+                            document_record=task.record,
+                            document_label=task.label,
+                            log_suffix=task.log_suffix,
+                        )
+                        # Print the totals now and then
+                        if run_state.documents_processed % PROGRESS_EVERY_N_DOCUMENTS == 0:
+                            log_totals()
+                    # The queue counts finished tasks, so the main thread knows when a page is done
+                    finally:
+                        work_queue.task_done()
+            # The tab belongs to this worker, so it is closed when the worker ends
+            finally:
+                close_own_download_tab()
+    # Chrome is gone, the network is down, or the connection failed: end the session for everybody
+    except BaseException as error:
+        # The main thread asked the workers to stop normally, so a late error must not restart the whole run
+        if worker_shutdown_event.is_set() and not session_abort_event.is_set():
+            # Only log it
+            logger.debug("Ignoring an error during the normal worker shutdown: %r", error)
+        # A real problem while working
+        else:
+            # Remember the original error and stop all threads
+            record_session_abort(error=error)
+
+
+# Start all worker threads
+def start_worker_threads(*, work_queue: queue.Queue) -> list[threading.Thread]:
+    # The started threads
+    worker_threads: list[threading.Thread] = []
+    # One thread per worker
+    for worker_number in range(1, WORKER_COUNT + 1):
+        # Daemon threads never block the exit of the program
+        worker_thread = threading.Thread(
+            target=run_worker_thread, kwargs={"work_queue": work_queue}, name=f"worker-{worker_number}", daemon=True
+        )
+        # Start it
+        worker_thread.start()
+        # Remember it
+        worker_threads.append(worker_thread)
+    # Tell the user
+    logger.info(f"Started {WORKER_COUNT} worker threads (they share the one Chrome and use their own tabs)")
+    # Hand the threads back
+    return worker_threads
+
+
+# Tell the workers to stop and wait until all of them have ended
+def stop_worker_threads(*, work_queue: queue.Queue, worker_threads: list[threading.Thread]) -> None:
+    # A normal shutdown (no abort yet): errors that happen while the workers disconnect are not real problems
+    if not session_abort_event.is_set():
+        # Remember that this is a normal shutdown
+        worker_shutdown_event.set()
+    # One stop signal per worker
+    for _ in worker_threads:
+        # The queue may be full when the session is aborted
+        try:
+            # None tells a worker to stop
+            work_queue.put_nowait(None)
+        # Aborted workers stop by themselves because of the abort flag
+        except queue.Full:
+            pass
+    # Wait for every worker (a worker finishes the file it is downloading first)
+    for worker_thread in worker_threads:
+        # Wait until it ended
+        worker_thread.join()
+
+
+# Put one task in the queue (waits while the queue is full, keeping the browser events flowing)
+def enqueue_task(*, work_queue: queue.Queue, results_tab: Page, task: DocumentTask) -> None:
+    # Until the task fits
+    while True:
+        # Stop if Chrome died, the network went down or a worker ended the session
+        raise_if_browser_unusable()
+        # The queue may be full
+        try:
+            # Try to add the task
+            work_queue.put(task, timeout=QUEUE_POLL_SECONDS)
+            # Done
+            return
+        # The queue is still full
+        except queue.Full:
+            # Let the main thread's Playwright connection process events (it also logs the worker tabs)
+            let_browser_process_events(tab=results_tab)
+
+
+# Wait until every queued task is finished
+def wait_for_queue_to_finish(*, work_queue: queue.Queue, results_tab: Page) -> None:
+    # unfinished_tasks counts queued tasks plus tasks that workers are still processing
+    while work_queue.unfinished_tasks > 0:
+        # Stop if Chrome died, the network went down or a worker ended the session
+        raise_if_browser_unusable()
+        # Let the main thread's Playwright connection process events
+        let_browser_process_events(tab=results_tab)
+
+
 # Give failed documents another chance (every few pages, and once more at the end)
 def retry_failing_documents(
-    *, browser_context: BrowserContext, rounds: int, is_final: bool
+    *, work_queue: queue.Queue, results_tab: Page, rounds: int, is_final: bool
 ) -> None:
     # A few rounds
     for round_number in range(1, rounds + 1):
         # During the run, documents that failed too often are left for the final round
-        waiting_documents = [
-            failing_document
-            for failing_document in run_state.failing_documents.values()
-            if is_final or failing_document.attempts < MAXIMUM_DOCUMENT_ATTEMPTS
-        ]
+        with state_lock:
+            waiting_documents = [
+                failing_document
+                for failing_document in run_state.failing_documents.values()
+                if is_final or failing_document.attempts < MAXIMUM_DOCUMENT_ATTEMPTS
+            ]
         # Nothing left to retry
         if not waiting_documents:
             return
         # Announce the round
-        logger.info(
-            f"=== Retry round {round_number}/{rounds}: {len(waiting_documents)} documents ==="
-        )
-        # The list is a copy because the dictionary changes while we work
+        logger.info(f"=== Retry round {round_number}/{rounds}: {len(waiting_documents)} documents ===")
+        # Hand every failed document to the workers
         for failing_document in waiting_documents:
-            # Try again (the suffix is only for logging)
-            process_document(
-                browser_context=browser_context,
-                document_record=failing_document.record,
-                document_label=failing_document.label,
-                log_suffix=f" (retry {round_number})",
+            # The suffix is only for logging
+            enqueue_task(
+                work_queue=work_queue,
+                results_tab=results_tab,
+                task=DocumentTask(
+                    record=failing_document.record,
+                    label=failing_document.label,
+                    log_suffix=f" (retry {round_number})",
+                ),
             )
-            # Wait briefly between documents
-            polite_pause()
+        # Wait until the workers finished the whole round
+        wait_for_queue_to_finish(work_queue=work_queue, results_tab=results_tab)
     # Some documents still fail at the very end
     if is_final and run_state.failing_documents:
         # Say so
-        logger.warning(
-            f"{len(run_state.failing_documents)} documents still fail after {rounds} retry rounds"
-        )
+        logger.warning(f"{len(run_state.failing_documents)} documents still fail after {rounds} retry rounds")
 
 
-# Check every document of one results page
+# Hand every document of one results page to the workers and wait until the whole page is finished
 def process_results_page(
     *,
-    browser_context: BrowserContext,
+    work_queue: queue.Queue,
     results_tab: Page,
     page_number: int,
     page_records: list[DocumentRecord],
     seen_internal_ids: set[str],
 ) -> None:
-    # How many documents were processed on this page
-    processed_count = 0
     # Every document of the page
     for position, document_record in enumerate(page_records, start=1):
         # The results tab disappeared
         if results_tab.is_closed():
             raise BrowserLostError("the results tab was closed")
-        # Chrome died or the internet went down
-        raise_if_browser_unusable()
         # Internal document ID
         internal_id = document_record["internal_id"]
-        # Already checked in this run (no second request)
+        # Already queued in this run (no second request)
         if internal_id in seen_internal_ids:
             # Log the skip
             logger.info(f"Document {internal_id} already checked in this run, skipping")
             continue
         # Remember this document
         seen_internal_ids.add(internal_id)
-        # Check it (errors are handled inside)
-        process_document(
-            browser_context=browser_context,
-            document_record=document_record,
-            document_label=f"[p{page_number} {position}/{len(page_records)}] {document_record['public_id'] or internal_id}",
-            log_suffix="",
+        # Hand it to the workers
+        enqueue_task(
+            work_queue=work_queue,
+            results_tab=results_tab,
+            task=DocumentTask(
+                record=document_record,
+                label=f"[p{page_number} {position}/{len(page_records)}] {document_record['public_id'] or internal_id}",
+                log_suffix="",
+            ),
         )
-        # Count it
-        processed_count += 1
-        # A batch boundary
-        if processed_count % PROGRESS_EVERY_N_DOCUMENTS == 0:
-            # Print the totals
-            log_totals()
+    # The saved resume page is only correct when the whole page is finished before the next page starts
+    wait_for_queue_to_finish(work_queue=work_queue, results_tab=results_tab)
 
 
-# Control the whole downloading process of one browser session
+# Control the whole downloading process of one browser session (this runs in the main thread)
 def download_all_documents(*, browser_context: BrowserContext) -> None:
     # Log in, search and wait until the results grid is shown
     results_tab = open_results_grid(browser_context=browser_context)
+    # The queue between the main thread (producer) and the workers (consumers)
+    work_queue: queue.Queue = queue.Queue(maxsize=WORKER_COUNT * QUEUE_SLOTS_PER_WORKER)
     # Documents seen in this session (a document on two pages is done once)
     seen_internal_ids: set[str] = set()
-    # Every results page
-    for page_number, total_page_count, page_records in iterate_results_pages(
-        browser_context=browser_context, tab=results_tab
-    ):
-        # Log the page
-        logger.info(
-            f"=== Results page {page_number}/{total_page_count}: {len(page_records)} documents ==="
-        )
-        # Remember this page, so a restart or crash continues here
-        save_current_results_page(page_number=page_number, total_pages=total_page_count)
-        # A new furthest page resets the restart counters
-        record_results_page_progress(page_number=page_number)
-        # Download its documents
-        process_results_page(
-            browser_context=browser_context,
-            results_tab=results_tab,
-            page_number=page_number,
-            page_records=page_records,
-            seen_internal_ids=seen_internal_ids,
-        )
-        # Time to retry what failed on earlier pages
-        if page_number % RETRY_FAILED_EVERY_N_PAGES == 0:
-            # Retry now instead of waiting for the very end
-            retry_failing_documents(
-                browser_context=browser_context, rounds=1, is_final=False
+    # Start the workers only now, when the log-in is done and the profile holds a valid session
+    worker_threads = start_worker_threads(work_queue=work_queue)
+    # Whatever happens, the workers must be stopped and joined
+    try:
+        # Every results page
+        for page_number, total_page_count, page_records in iterate_results_pages(
+            browser_context=browser_context, tab=results_tab
+        ):
+            # Log the page
+            logger.info(f"=== Results page {page_number}/{total_page_count}: {len(page_records)} documents ===")
+            # Remember this page, so a restart or crash continues here
+            save_current_results_page(page_number=page_number, total_pages=total_page_count)
+            # A new furthest page resets the restart counters
+            record_results_page_progress(page_number=page_number)
+            # Let the workers download its documents and wait until they are all finished
+            process_results_page(
+                work_queue=work_queue,
+                results_tab=results_tab,
+                page_number=page_number,
+                page_records=page_records,
+                seen_internal_ids=seen_internal_ids,
             )
-    # Give every failed document another chance
-    retry_failing_documents(
-        browser_context=browser_context, rounds=FINAL_RETRY_ROUNDS, is_final=True
-    )
-    # The whole search was finished, so the next run starts at page 1 again
-    clear_saved_results_page()
-    # Tell the user
-    logger.info("Finished all results pages")
+            # Time to retry what failed on earlier pages
+            if page_number % RETRY_FAILED_EVERY_N_PAGES == 0:
+                # Retry now instead of waiting for the very end
+                retry_failing_documents(work_queue=work_queue, results_tab=results_tab, rounds=1, is_final=False)
+        # Give every failed document another chance
+        retry_failing_documents(
+            work_queue=work_queue, results_tab=results_tab, rounds=FINAL_RETRY_ROUNDS, is_final=True
+        )
+        # The whole search was finished, so the next run starts at page 1 again
+        clear_saved_results_page()
+        # Tell the user
+        logger.info("Finished all results pages")
+    # Any error of the main thread (including Ctrl+C) ends the session for the workers too
+    except BaseException as main_error:
+        # Keeps the FIRST error: a worker's original error wins over the main thread's follow-up error
+        record_session_abort(error=main_error)
+    # Always runs
+    finally:
+        # Stop the workers and wait until every one has ended
+        stop_worker_threads(work_queue=work_queue, worker_threads=worker_threads)
+    # Something ended the session: raise the original error here, so the main loop handles it
+    if session_abort_errors:
+        raise session_abort_errors[0]
 
 
 # ===========================================================================
@@ -4211,6 +4360,12 @@ def download_all_documents(*, browser_context: BrowserContext) -> None:
 # ===========================================================================
 # Run one complete browser session; True when the whole run finished normally
 def run_browser_session(*, playwright_instance: Playwright) -> bool:
+    # A new session starts without any earlier abort
+    session_abort_event.clear()
+    # Forget the errors of the previous session
+    session_abort_errors.clear()
+    # A new session is not shutting down
+    worker_shutdown_event.clear()
     # The configured browser
     browser_context = launch_browser(playwright_instance=playwright_instance)
     # The browser must always be closed
@@ -4225,11 +4380,9 @@ def run_browser_session(*, playwright_instance: Playwright) -> bool:
         logger.info("Closing the browser")
         # Late close events of this context must not fake a crash of the next session
         run_state.active_browser_context = None
-        # The download tab dies with the browser
-        run_state.download_tab = None
         # Closing can fail
         try:
-            # Close the browser
+            # Close the browser (this also closes the worker tabs)
             browser_context.close()
         # The browser is already gone
         except PlaywrightError:
@@ -4243,10 +4396,7 @@ def count_restart_and_get_wait_seconds() -> int:
     # Count it for the growing wait
     run_state.restarts_without_progress += 1
     # Wait longer after every restart without progress
-    return min(
-        MAXIMUM_RESTART_WAIT_SECONDS,
-        RESTART_WAIT_SECONDS * run_state.restarts_without_progress,
-    )
+    return min(MAXIMUM_RESTART_WAIT_SECONDS, RESTART_WAIT_SECONDS * run_state.restarts_without_progress)
 
 
 # Keep starting browser sessions until one finishes
@@ -4264,15 +4414,11 @@ def run_until_finished() -> None:
         # One session
         try:
             # Announce every browser session
-            logger.info(
-                f"=== Starting browser session #{run_state.browser_restarts + 1} ==="
-            )
+            logger.info(f"=== Starting browser session #{run_state.browser_restarts + 1} ===")
             # Start Playwright
             with sync_playwright() as playwright_instance:
                 # Run one session
-                run_finished = run_browser_session(
-                    playwright_instance=playwright_instance
-                )
+                run_finished = run_browser_session(playwright_instance=playwright_instance)
         # Paging or reading a results page failed for good
         except PagingFailedError as error:
             # Count it
@@ -4356,9 +4502,7 @@ def main() -> int:
     # The user pressed Ctrl+C
     except KeyboardInterrupt:
         # Log it
-        logger.warning(
-            "Stopped by you (Ctrl+C). Run again to continue; finished documents and files are skipped."
-        )
+        logger.warning("Stopped by you (Ctrl+C). Run again to continue; finished documents and files are skipped.")
         # The conventional exit code for Ctrl+C
         exit_code = 130
     # Runs before exiting
