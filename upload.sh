@@ -6,43 +6,159 @@
 # Continuously watches a Git repository and does the following:
 # 1. Compresses each new or modified PDF (smallest first) as soon as it is found, then stages it.
 # 2. Uses the Git index (staging area) as the "already compressed" marker.
-# 3. Pushes when 25 compressed files (or about 1 GB) are staged, or when the maximum wait time has passed.
+# 3. Pushes as soon as the FIRST of these happens: 100 files are staged, about 1 GB is staged, or 12 hours have
+#    passed since the last push (all three limits are settings, see the option table below).
 # 4. Commits BEFORE pulling, so the batch is a real commit rather than fragile staged state.
 # 5. Never stages a PDF that was not compressed by this script.
 # 6. Exits immediately if any command fails (run it under systemd with Restart=on-failure).
 # 7. Shows EVERYTHING on the console only (no log file): this script, git, Ghostscript (page by page,
 #    labelled with the PDF being compressed) and, optionally, the logs of other apps such as the downloader.
-# 8. Ignores the downloader's half-finished '*.part' files, so they can never be committed.
+# 8. Ignores the downloader's half-finished '*.part' files and Chrome's temporary files and browser profile, so they
+#    can never be committed (see the ignore list in main).
 # 9. Protects production: timeouts on every external command, a free-disk check, a startup remote check,
 #    a periodic heartbeat, running statistics, and a final summary on exit.
-# Tunables can be overridden from the environment, e.g.: LOG_LEVEL_NUMBER=0 bash upload.sh
+# 10. Only compresses PDFs that are completely downloaded: a PDF is skipped while a '<name>.pdf.part' file exists,
+#     while it was modified less than PDF_SETTLE_SECONDS ago, while another process still has it open, or while it
+#     does not start with the PDF signature. It is checked again right before compression, and the compressed copy is
+#     thrown away if the PDF changed while Ghostscript was running, so a re-download is never overwritten.
+# The script takes NO command-line arguments: just run  bash upload.sh  (an argument is rejected with a clear message).
+# Every setting has a default and can be changed with an environment variable, e.g.  PDF_SETTLE_SECONDS=60 bash upload.sh
+# The value in use for EVERY setting, its default and where it came from are printed in the log at startup.
+# Everything is logged: every function call, every file operation and every git and Ghostscript line.
+# For a literal trace of every command as well: SHELL_TRACE=1 bash upload.sh
 # To merge the downloader's log into this one: EXTRA_LOG_FILES=/var/log/etsi-downloader.log bash upload.sh
 # -----------------------------------------------------------------------------
 
 set -Eeuo pipefail # Exit on errors, inherit the ERR trap in functions, fail on unset variables, fail on pipeline errors
 
-readonly SCRIPT_VERSION="2.1.0"                                                                                  # Version string shown in the startup report
+readonly SCRIPT_VERSION="2.6.0"                                                                                  # Version string shown in the startup report
 export LC_ALL=C                                                                                                  # Use plain byte-wise text handling so file names never confuse sort or grep
 export GIT_TERMINAL_PROMPT=0                                                                                     # Never let git wait for a password on a terminal nobody is watching
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30}" # Make SSH fail fast instead of hanging or prompting
 
-# ---------------- Configuration ----------------
+# ---------------- Options (priority: environment variable > default; the script takes NO arguments) ----------------
 
-readonly REPOSITORY_DIRECTORY="${REPOSITORY_DIRECTORY:-$PWD}"                       # Repository to watch (defaults to the current directory)
-readonly CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-5}"                      # Seconds to sleep between repository checks
-readonly MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-100}"                                    # Maximum number of files in one commit/push
-readonly MAX_BATCH_BYTES="${MAX_BATCH_BYTES:-1000000000}"                           # Stop adding PDFs at about 1 GB (GitHub rejects pushes over about 2 GB)
-readonly MAX_SECONDS_BETWEEN_PUSHES="${MAX_SECONDS_BETWEEN_PUSHES:-43200}"          # Force a push after this many seconds (12 hours)
-readonly GITHUB_MAX_FILE_BYTES="${GITHUB_MAX_FILE_BYTES:-104857600}"                # GitHub rejects files larger than 100 MiB
-readonly GHOSTSCRIPT_QUALITY="${GHOSTSCRIPT_QUALITY:-/ebook}"                       # Ghostscript preset: /screen, /ebook, /printer or /prepress
-readonly GHOSTSCRIPT_TIMEOUT_SECONDS="${GHOSTSCRIPT_TIMEOUT_SECONDS:-21600}"        # Kill Ghostscript if one PDF takes longer than this
-readonly GIT_LOCAL_TIMEOUT_SECONDS="${GIT_LOCAL_TIMEOUT_SECONDS:-300}"              # Time limit for local git commands (add, commit)
-readonly GIT_NETWORK_TIMEOUT_SECONDS="${GIT_NETWORK_TIMEOUT_SECONDS:-3600}"         # Time limit for git commands that use the network (pull, push)
-readonly MIN_FREE_DISK_MB="${MIN_FREE_DISK_MB:-1024}"                               # Exit if free disk space drops below this many megabytes
-readonly HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-60}"                               # How often to log an "I am alive" status line
-readonly LOG_LEVEL_NUMBER="${LOG_LEVEL_NUMBER:-0}"                                  # Log detail: 0=TRACE (everything), 1=DEBUG, 2=INFO, 3=WARN, 4=FATAL
-readonly EXTRA_LOG_FILES="${EXTRA_LOG_FILES:-}"                                     # Space-separated log files of OTHER apps to merge into this console output
-readonly LOCK_FILE="${LOCK_FILE:-/tmp/auto-sync${REPOSITORY_DIRECTORY//\//_}.lock}" # Lock file that prevents two copies running on one repository
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then # Associative arrays and mapfile -d need Bash 4.4 or newer
+	printf 'upload.sh: Bash 4.4 or newer is required (found %s).\n' "$BASH_VERSION" >&2 # Say so before anything else can fail in a confusing way
+	exit 1                                                                              # Stop at once
+fi                                                                                   # End of the Bash version check
+
+# The ONE table that defines every setting. Each entry is: ENVIRONMENT_VARIABLE|default|kind|meaning
+# kinds: int1 = whole number >= 1, int0 = whole number >= 0, bool = 0 or 1, level = 0 to 4, quality = Ghostscript preset, text = any text
+declare -ra OPTION_DEFINITIONS=(
+	"REPOSITORY_DIRECTORY|auto|text|Repository to watch (auto = the current directory)"
+	"CHECK_INTERVAL_SECONDS|5|int1|Seconds to sleep between repository checks"
+	"MAX_BATCH_SIZE|100|int1|Maximum number of files in one commit/push"
+	"MAX_BATCH_BYTES|1000000000|int1|Stop adding PDFs to a batch at about this many bytes (GitHub rejects pushes over about 2 GB)"
+	"MAX_SECONDS_BETWEEN_PUSHES|43200|int1|Force a push after this many seconds (43200 = 12 hours)"
+	"GITHUB_MAX_FILE_BYTES|104857600|int1|PDFs larger than this are ignored by Git (GitHub rejects files over 100 MiB)"
+	"GHOSTSCRIPT_QUALITY|/ebook|quality|Ghostscript preset: /screen, /ebook, /printer, /prepress or /default"
+	"GHOSTSCRIPT_TIMEOUT_SECONDS|21600|int1|Kill Ghostscript when one PDF takes longer than this many seconds"
+	"GIT_LOCAL_TIMEOUT_SECONDS|300|int1|Time limit in seconds for local git commands (add, commit)"
+	"GIT_NETWORK_TIMEOUT_SECONDS|3600|int1|Time limit in seconds for git commands that use the network (pull, push)"
+	"MIN_FREE_DISK_MB|1024|int0|Exit when free disk space drops below this many megabytes"
+	"HEARTBEAT_SECONDS|60|int1|How often to log an 'I am alive' status line"
+	"PDF_SETTLE_SECONDS|30|int0|A PDF must be unchanged for this many seconds before it counts as fully downloaded"
+	"LOG_EVERY_SKIPPED_PDF|1|bool|1 = log one line for every PDF that is skipped, 0 = log only the totals"
+	"LOG_LEVEL_NUMBER|0|level|Log detail: 0=TRACE (everything), 1=DEBUG, 2=INFO, 3=WARN, 4=FATAL"
+	"SHELL_TRACE|0|bool|1 = also print EVERY shell command with a timestamp (extremely verbose)"
+	"EXTRA_LOG_FILES||text|Space-separated log files of OTHER apps to merge into this console output"
+	"LOCK_FILE|auto|text|Lock file that prevents two copies running on one repository (auto = derived from the repository path)"
+)
+
+declare -A OPTION_SOURCES=() # Where the final value of each setting came from: environment or default
+OPTIONS_APPLIED=0            # Becomes 1 once every setting has its final value (before that nothing is started)
+
+function option_kind_hint() {                                          # Describe in words which values a setting accepts
+	case "$1" in                                                          # Look at the kind
+	int1) printf 'whole number, 1 or more' ;;                             # Positive number
+	int0) printf 'whole number, 0 or more' ;;                             # Non-negative number
+	bool) printf '0 or 1' ;;                                              # Switch
+	level) printf 'whole number from 0 to 4' ;;                           # Log level
+	quality) printf '/screen, /ebook, /printer, /prepress or /default' ;; # Ghostscript preset
+	*) printf 'text' ;;                                                   # Anything else
+	esac                                                                  # End of the kind lookup
+}                                                                      # End of option_kind_hint
+
+function print_option_error() {                                                                                   # Print a settings error and stop (used before logging exists)
+	printf 'upload.sh: %s\nFix that environment variable (or unset it to use the default) and run again.\n' "$1" >&2 # Explain the problem and the cure
+	exit 2                                                                                                           # Exit code 2 means "wrong usage"
+}                                                                                                                 # End of print_option_error
+
+function reject_arguments() {                                                                                                          # The script takes no arguments at all
+	if [[ $# -gt 0 ]]; then                                                                                                               # Somebody passed something
+		printf 'upload.sh: this script takes no arguments (got: %s).\n' "$*" >&2                                                             # Say what was rejected
+		printf 'Just run: bash upload.sh   (change a setting with an environment variable, e.g. PDF_SETTLE_SECONDS=60 bash upload.sh)\n' >&2 # Say how to change settings instead
+		exit 2                                                                                                                               # Exit code 2 means "wrong usage"
+	fi                                                                                                                                    # End of the argument check
+}                                                                                                                                      # End of reject_arguments
+
+function apply_options() {                                                                                # Give every setting its final, validated value (and make it read-only)
+	local entry variable default kind description value source hint                                          # Working variables
+	for entry in "${OPTION_DEFINITIONS[@]}"; do                                                              # Go through the table in order
+		IFS='|' read -r variable default kind description <<<"$entry"                                           # Split the entry into its four fields
+		hint=$(option_kind_hint "$kind")                                                                        # The accepted values, for messages
+		if [[ -n "${!variable+x}" ]]; then                                                                      # 1) an environment variable is set
+			value="${!variable}"                                                                                   # Use it
+			source="environment"                                                                                   # Remember where it came from
+		else                                                                                                    # 2) the default
+			value="$default"                                                                                       # Use it
+			source="default"                                                                                       # Remember where it came from
+		fi                                                                                                      # End of the priority check
+		if [[ $value == "auto" ]]; then                                                                         # "auto" values are worked out here
+			case "$variable" in                                                                                    # Which setting?
+			REPOSITORY_DIRECTORY) value="$PWD" ;;                                                                  # The current directory
+			LOCK_FILE) value="/tmp/auto-sync${REPOSITORY_DIRECTORY//\//_}.lock" ;;                                 # Derived from the repository path (set earlier in this loop)
+			esac                                                                                                   # End of the auto lookup
+		fi                                                                                                      # End of the auto check
+		case "$kind" in                                                                                         # Check the value
+		int1 | int0 | level)                                                                                    # Numbers
+			if [[ ! $value =~ ^[0-9]+$ ]]; then                                                                    # Not a plain non-negative whole number
+				print_option_error "invalid value '${value}' for ${variable} (from ${source}): expected ${hint}"      # Stop with a clear message
+			fi                                                                                                     # End of the number check
+			value=$((10#$value))                                                                                   # Normalise (so 08 is not read as octal)
+			if [[ ($kind == int1 && $value -lt 1) || ($kind == level && $value -gt 4) ]]; then                     # Out of range
+				print_option_error "invalid value '${value}' for ${variable} (from ${source}): expected ${hint}"      # Stop with a clear message
+			fi                                                                                                     # End of the range check
+			;;                                                                                                     # End of the number case
+		bool)                                                                                                   # Switches
+			if [[ $value != "0" && $value != "1" ]]; then                                                          # Neither 0 nor 1
+				print_option_error "invalid value '${value}' for ${variable} (from ${source}): expected ${hint}"      # Stop with a clear message
+			fi                                                                                                     # End of the switch check
+			;;                                                                                                     # End of the switch case
+		quality)                                                                                                # Ghostscript presets
+			case "$value" in                                                                                       # Which preset?
+			/screen | /ebook | /printer | /prepress | /default) ;;                                                 # All valid
+			*) print_option_error "invalid value '${value}' for ${variable} (from ${source}): expected ${hint}" ;; # Stop with a clear message
+			esac                                                                                                   # End of the preset check
+			;;                                                                                                     # End of the preset case
+		esac                                                                                                    # End of the value check
+		declare -gr "${variable}=${value}"                                                                      # Create the read-only global variable the rest of the script uses
+		OPTION_SOURCES["$variable"]="$source"                                                                   # Remember where the value came from
+	done                                                                                                     # End of the table loop
+	OPTIONS_APPLIED=1                                                                                        # Every setting now has its final value
+}                                                                                                         # End of apply_options
+
+function enable_shell_trace_if_requested() {       # Print every shell command with a timestamp when SHELL_TRACE=1
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2 # Log that this function was called, with its arguments
+	if [[ $SHELL_TRACE == "1" ]]; then                # Requested
+		PS4='+ \D{%T} ${FUNCNAME[0]:-main}:${LINENO}: '  # Prefix each traced command with the time, the function name and the line number
+		set -x                                           # Turn command tracing on
+	fi                                                # End of the request check
+}                                                  # End of enable_shell_trace_if_requested
+
+function log_all_options() {                                                                                                    # Log EVERY setting with its value, default, source and meaning
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                              # Log that this function was called, with its arguments
+	local entry variable default kind description                                                                                  # Fields of one table entry
+	log_message INFO "===== OPTIONS (priority: environment variable > default; the script takes no arguments) ====="               # Start of the list
+	for entry in "${OPTION_DEFINITIONS[@]}"; do                                                                                    # Every setting of the table
+		IFS='|' read -r variable default kind description <<<"$entry"                                                                 # Split the entry into its four fields
+		log_message INFO "OPTION ${variable}='${!variable}' [default '${default}'; from ${OPTION_SOURCES[$variable]}] ${description}" # One line per setting
+	done                                                                                                                           # End of the setting loop
+	log_message INFO "===== END OF OPTIONS ====="                                                                                  # End of the list
+}                                                                                                                               # End of log_all_options
+
+# The option values are created by apply_options at the start of main; until then only the table above exists.
 
 # ---------------- Mutable State ----------------
 
@@ -92,7 +208,7 @@ function log_message() {                                                 # Print
 	FATAL) level_number=4 ;;                                                # The script is about to exit
 	*) level_number=2 ;;                                                    # INFO, ACTION, SUCCESS and anything else
 	esac                                                                    # End of the level translation
-	if [[ $level_number -ge $LOG_LEVEL_NUMBER ]]; then                      # Print only if this level is enabled
+	if [[ $level_number -ge ${LOG_LEVEL_NUMBER:-0} ]]; then                 # Print only if this level is enabled
 		printf '%(%Y-%m-%dT%H:%M:%S%z)T [%s] %s\n' -1 "$level_name" "$message" # Print: local timestamp with UTC offset, level, message
 	fi                                                                      # End of the level check
 }                                                                        # End of log_message
@@ -125,6 +241,7 @@ function run_logged_command() {                                                 
 }                                                                                                                                              # End of run_logged_command
 
 function start_following_extra_logs() {                                                                           # Merge other apps' log files into this console output
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                # Log that this function was called, with its arguments
 	local followed_log_file                                                                                          # Loop variable for each extra log file
 	if [[ -z "$EXTRA_LOG_FILES" ]]; then                                                                             # Nothing configured
 		log_message DEBUG "No extra log files configured (set EXTRA_LOG_FILES to merge other apps' logs)."              # Explain how to enable the feature
@@ -143,6 +260,7 @@ function start_following_extra_logs() {                                         
 # ---------------- Statistics ----------------
 
 function log_statistics() {                                                                                                                                                                                           # Log the running totals
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                                    # Log that this function was called, with its arguments
 	local saved_bytes=$((TOTAL_BYTES_BEFORE - TOTAL_BYTES_AFTER))                                                                                                                                                        # Bytes saved by compression so far
 	local saved_percent=0                                                                                                                                                                                                # Percentage saved (stays 0 until something was compressed)
 	local uptime_seconds=0                                                                                                                                                                                               # Seconds since the main loop started
@@ -157,16 +275,17 @@ function log_statistics() {                                                     
 	log_message INFO "STATS: pushes=${TOTAL_PUSHES} files-pushed=${TOTAL_FILES_PUSHED} data-pushed=$(format_bytes "$TOTAL_BYTES_PUSHED")"                                                                                # Push counters
 }                                                                                                                                                                                                                     # End of log_statistics
 
-function log_heartbeat_if_due() {                                                                                                                                                                                                                                     # Log a periodic status line so operators know the script is alive
-	local current_epoch                                                                                                                                                                                                                                                  # The current time
-	current_epoch=$(date +%s)                                                                                                                                                                                                                                            # Read the current time
-	if [[ $((current_epoch - LAST_HEARTBEAT_EPOCH)) -lt $HEARTBEAT_SECONDS ]]; then                                                                                                                                                                                      # Not due yet
-		return 0                                                                                                                                                                                                                                                            # Nothing to do
-	fi                                                                                                                                                                                                                                                                   # End of the due check
-	LAST_HEARTBEAT_EPOCH=$current_epoch                                                                                                                                                                                                                                  # Remember when this heartbeat happened
-	log_message INFO "HEARTBEAT: alive. staged=${STAGED_FILE_COUNT}/${MAX_BATCH_SIZE} files ($(format_bytes "$STAGED_BYTES")), ${SECONDS_SINCE_LAST_PUSH}s since last push, free disk repo=$(available_megabytes .) MB temp=$(available_megabytes "$WORK_DIRECTORY") MB" # Status line
-	log_statistics                                                                                                                                                                                                                                                       # Include the running totals
-}                                                                                                                                                                                                                                                                     # End of log_heartbeat_if_due
+function log_heartbeat_if_due() {                                                                                                                                                                                                                                                                                                                                                                     # Log a periodic status line so operators know the script is alive
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                                                                                                                                                                                                                    # Log that this function was called, with its arguments
+	local current_epoch                                                                                                                                                                                                                                                                                                                                                                                  # The current time
+	current_epoch=$(date +%s)                                                                                                                                                                                                                                                                                                                                                                            # Read the current time
+	if [[ $((current_epoch - LAST_HEARTBEAT_EPOCH)) -lt $HEARTBEAT_SECONDS ]]; then                                                                                                                                                                                                                                                                                                                      # Not due yet
+		return 0                                                                                                                                                                                                                                                                                                                                                                                            # Nothing to do
+	fi                                                                                                                                                                                                                                                                                                                                                                                                   # End of the due check
+	LAST_HEARTBEAT_EPOCH=$current_epoch                                                                                                                                                                                                                                                                                                                                                                  # Remember when this heartbeat happened
+	log_message INFO "HEARTBEAT: alive. progress to the three push limits: files=${STAGED_FILE_COUNT}/${MAX_BATCH_SIZE}, bytes=${STAGED_BYTES}/${MAX_BATCH_BYTES} ($(format_bytes "$STAGED_BYTES") of $(format_bytes "$MAX_BATCH_BYTES")), time=${SECONDS_SINCE_LAST_PUSH}s/${MAX_SECONDS_BETWEEN_PUSHES}s, free disk repo=$(available_megabytes .) MB temp=$(available_megabytes "$WORK_DIRECTORY") MB" # Status line
+	log_statistics                                                                                                                                                                                                                                                                                                                                                                                       # Include the running totals
+}                                                                                                                                                                                                                                                                                                                                                                                                     # End of log_heartbeat_if_due
 
 # ---------------- Error Handling and Cleanup ----------------
 
@@ -181,6 +300,9 @@ function handle_unexpected_error() {               # Called by the ERR trap when
 
 function cleanup_on_exit() {                                         # Called by the EXIT trap on every exit path
 	local exit_code=$?                                                  # Capture the exit code first, before any other command changes it
+	if [[ $OPTIONS_APPLIED -eq 0 ]]; then                               # --help, --version or a bad flag: nothing was started, so there is nothing to clean up
+		return 0                                                           # Leave quietly (the exit code is not changed)
+	fi                                                                  # End of the early-exit check
 	local follower_pid                                                  # Loop variable for background log followers
 	log_message INFO "Shutting down with exit code ${exit_code}."       # Log why and how we stop
 	if [[ $STARTED_EPOCH -ne 0 ]]; then                                 # Only report statistics if the main loop ran
@@ -202,6 +324,7 @@ trap cleanup_on_exit EXIT                                          # Always clea
 # ---------------- Startup Checks ----------------
 
 function verify_dependencies() {                                                                                                             # Make sure every required program exists
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                           # Log that this function was called, with its arguments
 	log_message DEBUG "Checking system dependencies..."                                                                                         # Log the start of the check
 	if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then                                                        # mapfile -d requires Bash 4.4 or newer
 		fail_and_exit "Bash 4.4 or newer is required (found ${BASH_VERSION})."                                                                     # Stop if Bash is too old
@@ -214,10 +337,16 @@ function verify_dependencies() {                                                
 		fi                                                                                                                                         # End of the lookup check
 		log_message TRACE "Found '${command_name}' at ${command_path}"                                                                             # Log where it was found
 	done                                                                                                                                        # End of the dependency loop
+	if command -v fuser >/dev/null; then                                                                                                        # fuser is optional: it detects PDFs that another process still has open
+		log_message DEBUG "'fuser' found: PDFs that another process still has open are skipped."                                                   # Log the extra protection
+	else                                                                                                                                        # fuser is not installed
+		log_message DEBUG "'fuser' not found (package psmisc): relying on .part files and the ${PDF_SETTLE_SECONDS}s settle time only."            # Explain what protects us instead
+	fi                                                                                                                                          # End of the fuser check
 	log_message DEBUG "All system dependencies verified."                                                                                       # Log success
 }                                                                                                                                            # End of verify_dependencies
 
 function acquire_single_instance_lock() {                                       # Refuse to run if another copy is already running
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                              # Log that this function was called, with its arguments
 	exec 9>"${LOCK_FILE}"                                                          # Open the lock file on file descriptor 9 (kept open for the script's lifetime)
 	if ! flock --nonblock 9; then                                                  # Try to take the lock without waiting
 		fail_and_exit "Another instance is already running (lock file ${LOCK_FILE})." # Stop if the lock is held
@@ -226,6 +355,7 @@ function acquire_single_instance_lock() {                                       
 }                                                                               # End of acquire_single_instance_lock
 
 function enter_repository_root() {                                          # Change into the top directory of the Git repository
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                          # Log that this function was called, with its arguments
 	local repository_root                                                      # Will hold the repository's top-level path
 	cd -- "${REPOSITORY_DIRECTORY}"                                            # Move into the configured directory (fails loudly if missing)
 	if ! repository_root=$(git rev-parse --show-toplevel); then                # Ask Git where the repository root is
@@ -236,6 +366,7 @@ function enter_repository_root() {                                          # Ch
 }                                                                           # End of enter_repository_root
 
 function verify_remote_access() {                                                                 # Check up front that pushing can work, before compressing anything
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                # Log that this function was called, with its arguments
 	local upstream_name                                                                              # Upstream branch, e.g. origin/main
 	local remote_name                                                                                # Remote name, e.g. origin
 	local remote_url                                                                                 # Remote URL with any credentials hidden
@@ -251,11 +382,13 @@ function verify_remote_access() {                                               
 }                                                                                                 # End of verify_remote_access
 
 function prepare_work_directory() {                                # Create a private temporary directory for Ghostscript
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                 # Log that this function was called, with its arguments
 	WORK_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/auto-sync.XXXXXX")    # Make a unique, writable directory (honours TMPDIR, defaults to /tmp)
 	log_message DEBUG "Created temporary directory ${WORK_DIRECTORY}" # Log its location
 }                                                                  # End of prepare_work_directory
 
 function verify_free_disk_space() {                                                                                                               # Exit if the disk is nearly full, so commits and files never get corrupted
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                # Log that this function was called, with its arguments
 	local repository_free_megabytes                                                                                                                  # Free space where the repository lives
 	local work_free_megabytes                                                                                                                        # Free space where temporary files live
 	repository_free_megabytes=$(available_megabytes .)                                                                                               # Measure the repository filesystem
@@ -269,34 +402,39 @@ function verify_free_disk_space() {                                             
 	fi                                                                                                                                               # End of the temporary disk check
 }                                                                                                                                                 # End of verify_free_disk_space
 
-function log_environment_report() {                                                                                                                             # Log everything an operator needs to know about this run
-	local pending_change_count                                                                                                                                     # Files Git sees as changed at startup
-	pending_change_count=$(git status --porcelain --untracked-files=all | wc -l)                                                                                   # Count changes (staged, unstaged and untracked)
-	log_message INFO "===== STARTUP REPORT ====="                                                                                                                  # Start of the report
-	log_message INFO "Script version ${SCRIPT_VERSION}, PID $$, user $(id -un), host ${HOSTNAME:-unknown}"                                                         # Who is running what, where
-	log_message INFO "System: $(uname -sr), bash ${BASH_VERSION}"                                                                                                  # Operating system and shell
-	log_message INFO "Tools: $(git --version), ghostscript $(gs --version)"                                                                                        # Versions of the programs we depend on
-	log_message INFO "Git: branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo none), HEAD $(git rev-parse --short HEAD 2>/dev/null || echo none)"        # Where the repository stands
-	log_message INFO "Changes pending at startup: ${pending_change_count} file(s)"                                                                                 # How much work is waiting
-	log_message INFO "Free disk: repository=$(available_megabytes .) MB, temp=$(available_megabytes "$WORK_DIRECTORY") MB"                                         # Disk headroom
-	log_message INFO "Batch: ${MAX_BATCH_SIZE} files or ${MAX_BATCH_BYTES} bytes; max wait ${MAX_SECONDS_BETWEEN_PUSHES}s; check every ${CHECK_INTERVAL_SECONDS}s" # Push settings
-	log_message INFO "Ghostscript: quality ${GHOSTSCRIPT_QUALITY}, timeout ${GHOSTSCRIPT_TIMEOUT_SECONDS}s; GitHub file limit ${GITHUB_MAX_FILE_BYTES} bytes"      # Compression settings
-	log_message INFO "Timeouts: local git ${GIT_LOCAL_TIMEOUT_SECONDS}s, network git ${GIT_NETWORK_TIMEOUT_SECONDS}s; minimum free disk ${MIN_FREE_DISK_MB} MB"    # Safety settings
-	log_message INFO "Logging: console only, level ${LOG_LEVEL_NUMBER}, heartbeat ${HEARTBEAT_SECONDS}s, extra logs '${EXTRA_LOG_FILES}'"                          # Logging settings
-	log_message INFO "===== END OF STARTUP REPORT ====="                                                                                                           # End of the report
-}                                                                                                                                                               # End of log_environment_report
+function log_environment_report() {                                                                                                                                                                                                                                               # Log everything an operator needs to know about this run
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                                                                                                # Log that this function was called, with its arguments
+	local pending_change_count                                                                                                                                                                                                                                                       # Files Git sees as changed at startup
+	pending_change_count=$(git status --porcelain --untracked-files=all | wc -l)                                                                                                                                                                                                     # Count changes (staged, unstaged and untracked)
+	log_message INFO "===== STARTUP REPORT ====="                                                                                                                                                                                                                                    # Start of the report
+	log_message INFO "Script version ${SCRIPT_VERSION}, PID $$, user $(id -un), host ${HOSTNAME:-unknown}"                                                                                                                                                                           # Who is running what, where
+	log_message INFO "System: $(uname -sr), bash ${BASH_VERSION}"                                                                                                                                                                                                                    # Operating system and shell
+	log_message INFO "Tools: $(git --version), ghostscript $(gs --version)"                                                                                                                                                                                                          # Versions of the programs we depend on
+	log_message INFO "Git: branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo none), HEAD $(git rev-parse --short HEAD 2>/dev/null || echo none)"                                                                                                                          # Where the repository stands
+	log_message INFO "Changes pending at startup: ${pending_change_count} file(s)"                                                                                                                                                                                                   # How much work is waiting
+	log_message INFO "Free disk: repository=$(available_megabytes .) MB, temp=$(available_megabytes "$WORK_DIRECTORY") MB"                                                                                                                                                           # Disk headroom
+	log_message INFO "PUSH RULE: push as soon as the FIRST of these happens: ${MAX_BATCH_SIZE} files staged, ${MAX_BATCH_BYTES} bytes staged ($(format_bytes "$MAX_BATCH_BYTES")), or ${MAX_SECONDS_BETWEEN_PUSHES}s since the last push; checking every ${CHECK_INTERVAL_SECONDS}s" # Push settings
+	log_message INFO "Ghostscript: quality ${GHOSTSCRIPT_QUALITY}, timeout ${GHOSTSCRIPT_TIMEOUT_SECONDS}s; GitHub file limit ${GITHUB_MAX_FILE_BYTES} bytes"                                                                                                                        # Compression settings
+	log_message INFO "Downloads: PDFs are compressed only when no .part file exists and they were unchanged for ${PDF_SETTLE_SECONDS}s"                                                                                                                                              # Download-safety settings
+	log_message INFO "Timeouts: local git ${GIT_LOCAL_TIMEOUT_SECONDS}s, network git ${GIT_NETWORK_TIMEOUT_SECONDS}s; minimum free disk ${MIN_FREE_DISK_MB} MB"                                                                                                                      # Safety settings
+	log_message INFO "Logging: console only, level ${LOG_LEVEL_NUMBER}, heartbeat ${HEARTBEAT_SECONDS}s, extra logs '${EXTRA_LOG_FILES}', every skipped PDF logged ${LOG_EVERY_SKIPPED_PDF}, shell trace ${SHELL_TRACE:-0}"                                                          # Logging settings
+	log_message INFO "===== END OF STARTUP REPORT ====="                                                                                                                                                                                                                             # End of the report
+}                                                                                                                                                                                                                                                                                 # End of log_environment_report
 
 # ---------------- Git Helpers ----------------
 
 function count_staged_files() {                     # Print how many files are currently staged
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2  # Log that this function was called, with its arguments
 	git diff --cached --name-only --no-renames | wc -l # Count staged paths (renames counted as two, matching the commit)
 }                                                   # End of count_staged_files
 
 function count_staged_bytes() {                                                                                                             # Print the total size in bytes of the staged files
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                          # Log that this function was called, with its arguments
 	git diff --cached --name-only -z --no-renames --diff-filter=AM | xargs -0 -r stat -c %s -- | awk '{ total += $1 } END { print total + 0 }' # Sum the sizes of staged files (deletions have no size)
 }                                                                                                                                           # End of count_staged_bytes
 
 function add_local_ignore_rule() {                                                    # Add a rule to the repository's local ignore file (never committed)
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                    # Log that this function was called, with its arguments
 	local ignore_rule="$1"                                                               # The gitignore rule to add
 	local exclude_file                                                                   # Path to the repository's local ignore file
 	exclude_file=$(git rev-parse --git-path info/exclude)                                # Ask Git where the local exclude file lives
@@ -309,19 +447,111 @@ function add_local_ignore_rule() {                                              
 	log_message INFO "Added local ignore rule '${ignore_rule}' to ${exclude_file}"       # Log the change
 }                                                                                     # End of add_local_ignore_rule
 
-function list_pdfs_to_compress() {            # Print (NUL-separated) the smallest unstaged PDFs, up to a limit
-	local maximum_files="$1"                     # How many PDFs to list at most
-	{                                            # Start a group that merges two Git listings
-		git ls-files -z --others --exclude-standard # New (untracked) files, NUL-separated so odd filenames are safe
-		git diff --name-only -z --diff-filter=MT    # Modified files that still exist (deleted files are excluded on purpose)
-	} | grep -z -i '\.pdf$' |                    # Keep only PDF paths (case-insensitive)
-		xargs -0 -r stat --printf='%s\t%n\0' -- |   # Prefix each path with its size in bytes
-		sort -z -n |                                # Sort by size, smallest first
-		sed -z -n "1,${maximum_files}p" |           # Keep only as many as fit in the batch (reads ALL input, so sort never gets a broken pipe)
-		cut -z -f2-                                 # Drop the size column, leaving only the paths
-}                                             # End of list_pdfs_to_compress
+function pdf_is_finished_downloading() {                                                                                          # Succeed only when a PDF is completely downloaded and nothing is still writing to it (logs go to stderr because this runs inside pipelines)
+	local pdf_path="$1"                                                                                                              # The PDF to check
+	local modified_epoch                                                                                                             # When the PDF was last written
+	local age_seconds                                                                                                                # Seconds since the PDF was last written
+	if [[ -e "${pdf_path}.part" ]]; then                                                                                             # The downloader writes '<name>.pdf.part' and renames it to '<name>.pdf' only when finished
+		log_message TRACE "Skipping '${pdf_path}': a .part file exists, so it is still downloading." >&2                                # Say why it is skipped
+		return 1                                                                                                                        # Not finished
+	fi                                                                                                                               # End of the .part check
+	if ! modified_epoch=$(stat -c %Y -- "$pdf_path" 2>/dev/null); then                                                               # Read the last-modified time (fails if the file vanished)
+		log_message TRACE "Skipping '${pdf_path}': it no longer exists." >&2                                                            # Say why it is skipped
+		return 1                                                                                                                        # Not usable
+	fi                                                                                                                               # End of the modification-time read
+	printf -v age_seconds '%(%s)T' -1                                                                                                # Read the current time without starting another process
+	age_seconds=$((age_seconds - modified_epoch))                                                                                    # Work out how long ago it was last written
+	if [[ $age_seconds -lt $PDF_SETTLE_SECONDS ]]; then                                                                              # Written very recently: a download may still be finishing or about to be replaced
+		log_message TRACE "Skipping '${pdf_path}': modified ${age_seconds}s ago (it must be unchanged for ${PDF_SETTLE_SECONDS}s)." >&2 # Say why it is skipped
+		return 1                                                                                                                        # Not settled yet
+	fi                                                                                                                               # End of the settle check
+	if command -v fuser >/dev/null && fuser -s -- "$pdf_path" 2>/dev/null; then                                                      # If fuser exists, check whether any process still has the file open
+		log_message TRACE "Skipping '${pdf_path}': another process still has it open." >&2                                              # Say why it is skipped
+		return 1                                                                                                                        # Still in use
+	fi                                                                                                                               # End of the open-file check
+	if [[ "$(head -c 5 -- "$pdf_path" 2>/dev/null || true)" != "%PDF-" ]]; then                                                      # A real PDF starts with the %PDF- signature (this also rejects empty files)
+		log_message TRACE "Skipping '${pdf_path}': it does not start with the PDF signature yet." >&2                                   # Say why it is skipped
+		return 1                                                                                                                        # Not a complete PDF
+	fi                                                                                                                               # End of the signature check
+	return 0                                                                                                                         # Every check passed: the PDF is finished
+}                                                                                                                                 # End of pdf_is_finished_downloading
+
+function filter_finished_pdfs() {                                                                  # Read NUL-separated PDF paths on standard input and print only the finished ones (slow per file, so only used on a short list)
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                 # Log that this function was called, with its arguments
+	local pdf_path                                                                                    # Holds one path
+	while IFS= read -r -d '' pdf_path; do                                                             # Read every NUL-terminated path
+		if pdf_is_finished_downloading "$pdf_path"; then                                                 # Keep it only if it is completely downloaded
+			log_message TRACE "[scan] accepted '${pdf_path}': finished downloading, ready to compress." >&2 # Say that it passed every check
+			printf '%s\0' "$pdf_path"                                                                       # Pass it on, NUL-terminated
+		fi                                                                                               # End of the finished check
+	done                                                                                              # End of the path loop
+}                                                                                                  # End of filter_finished_pdfs
+
+function log_pipeline_count() {                            # Pass NUL-separated records through unchanged and log how many went by (shows every scan stage)
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2         # Log that this function was called, with its arguments
+	local stage_label="$1"                                    # What was counted
+	local record                                              # Holds one record
+	local counted=0                                           # How many records passed
+	while IFS= read -r -d '' record; do                       # Read every NUL-terminated record
+		counted=$((counted + 1))                                 # Count it
+		printf '%s\0' "$record"                                  # Pass it on unchanged
+	done                                                      # End of the record loop
+	log_message TRACE "[scan] ${stage_label}: ${counted}" >&2 # Report the total (stderr, because this runs inside a pipeline)
+}                                                          # End of log_pipeline_count
+
+function filter_settled_pdfs() {                                                                                                                                             # Fast bulk filter: read NUL-separated "mtime<TAB>size<TAB>path" records and keep those unchanged for PDF_SETTLE_SECONDS (uses no external programs, so it is fast even for 10000+ files)
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                           # Log that this function was called, with its arguments
+	local record                                                                                                                                                                # Holds one record
+	local tab=$'\t'                                                                                                                                                             # A tab character, used to split the record
+	local modified_epoch                                                                                                                                                        # The modification time part of the record
+	local size_and_path                                                                                                                                                         # The "size<TAB>path" part of the record
+	local current_epoch                                                                                                                                                         # The current time, read once
+	local total_count=0                                                                                                                                                         # How many PDFs were checked
+	local kept_count=0                                                                                                                                                          # How many PDFs were old enough
+	local too_recent_count=0                                                                                                                                                    # How many PDFs were skipped because they were written moments ago
+	printf -v current_epoch '%(%s)T' -1                                                                                                                                         # Read the current time without starting another process
+	while IFS= read -r -d '' record; do                                                                                                                                         # Read every NUL-terminated record
+		total_count=$((total_count + 1))                                                                                                                                           # Count this PDF
+		if ((total_count % 2000 == 0)); then                                                                                                                                       # Show progress now and then on huge repositories
+			log_message TRACE "[scan] settle check progress: ${total_count} PDFs checked so far..." >&2                                                                               # Say that the script is still working
+		fi                                                                                                                                                                         # End of the progress report
+		modified_epoch="${record%%"$tab"*}"                                                                                                                                        # Everything before the first tab is the modification time
+		size_and_path="${record#*"$tab"}"                                                                                                                                          # Everything after the first tab is "size<TAB>path"
+		if ((current_epoch - modified_epoch >= PDF_SETTLE_SECONDS)); then                                                                                                          # Unchanged for long enough
+			kept_count=$((kept_count + 1))                                                                                                                                            # Count it
+			printf '%s\0' "$size_and_path"                                                                                                                                            # Pass it on for sorting by size
+		else                                                                                                                                                                       # Written moments ago: a download may still be finishing
+			too_recent_count=$((too_recent_count + 1))                                                                                                                                # Count it
+			if [[ $LOG_EVERY_SKIPPED_PDF == "1" ]]; then                                                                                                                              # One line per skipped file was requested
+				log_message TRACE "[scan] skipping '${size_and_path#*"$tab"}': modified $((current_epoch - modified_epoch))s ago (it must be unchanged for ${PDF_SETTLE_SECONDS}s)." >&2 # Say why it is skipped
+			fi                                                                                                                                                                        # End of the per-file report
+		fi                                                                                                                                                                         # End of the settle check
+	done                                                                                                                                                                        # End of the record loop
+	log_message TRACE "[scan] settle check: ${total_count} PDFs checked, ${kept_count} settled, ${too_recent_count} too recent." >&2                                            # Report the totals (stderr, because this runs inside a pipeline)
+}                                                                                                                                                                            # End of filter_settled_pdfs
+
+function list_pdfs_to_compress() {                                                      # Print (NUL-separated) the smallest finished, unstaged PDFs, up to a limit
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                      # Log that this function was called, with its arguments
+	local maximum_files="$1"                                                               # How many PDFs to list at most
+	log_message TRACE "[scan] asking Git for new and modified files..." >&2                # Say what is happening now
+	{                                                                                      # Start a group that merges two Git listings
+		git ls-files -z --others --exclude-standard                                           # New (untracked) files, NUL-separated so odd filenames are safe
+		git diff --name-only -z --diff-filter=MT                                              # Modified files that still exist (deleted files are excluded on purpose)
+	} | log_pipeline_count "files reported by Git (all types)" |                           # Show how many files Git found
+		grep -z -i '\.pdf$' |                                                                 # Keep only PDF paths (case-insensitive); '*.pdf.part' files never match
+		log_pipeline_count "PDF files among them" |                                           # Show how many are PDFs
+		xargs -0 -r stat --printf='%Y\t%s\t%n\0' -- |                                         # One stat run for all files: modification time, size and path
+		filter_settled_pdfs |                                                                 # Fast bulk filter: drop PDFs written within the last PDF_SETTLE_SECONDS
+		sort -z -n |                                                                          # Sort by size, smallest first
+		sed -z -n "1,${maximum_files}p" |                                                     # Keep only as many as fit in the batch (reads ALL input, so sort never gets a broken pipe)
+		cut -z -f2- |                                                                         # Drop the size column, leaving only the paths
+		log_pipeline_count "smallest PDFs selected for the checks (limit ${maximum_files})" | # Show how many were selected
+		filter_finished_pdfs |                                                                # Slow per-file checks (.part file, open file, PDF signature) on this SHORT list only
+		log_pipeline_count "finished PDFs ready to compress"                                  # Show how many passed every check
+}                                                                                       # End of list_pdfs_to_compress
 
 function list_other_changed_files() {                                          # Print (NUL-separated) non-PDF changes plus deletions, up to a limit
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                             # Log that this function was called, with its arguments
 	local maximum_files="$1"                                                      # How many paths to list at most
 	{                                                                             # Start a group that merges three Git listings
 		git ls-files -z --others --exclude-standard | grep -z -v -i '\.pdf$' || true # New non-PDF files (grep exits 1 when nothing matches, which is fine)
@@ -333,6 +563,7 @@ function list_other_changed_files() {                                          #
 # ---------------- Phase 1: PDF Compression ----------------
 
 function exclude_oversized_pdf() {                                                         # Tell Git (locally) to ignore a PDF that GitHub would reject
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                         # Log that this function was called, with its arguments
 	local pdf_path="$1"                                                                       # The oversized PDF
 	local escaped_path                                                                        # PDF path with glob characters escaped
 	escaped_path=$(printf '%s' "$pdf_path" | sed -e 's/[][\\*?]/\\&/g')                       # Escape characters that gitignore treats as wildcards
@@ -342,11 +573,13 @@ function exclude_oversized_pdf() {                                              
 }                                                                                          # End of exclude_oversized_pdf
 
 function compress_and_stage_pdf() {                                                                                              # Compress one PDF with Ghostscript and stage it
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                               # Log that this function was called, with its arguments
 	local pdf_path="$1"                                                                                                             # The PDF to process
 	local position_text="$2"                                                                                                        # Progress marker such as [3/57]
 	local temporary_input="${WORK_DIRECTORY}/input.pdf"                                                                             # Private copy of the PDF that Ghostscript reads
 	local temporary_output="${WORK_DIRECTORY}/output.pdf"                                                                           # Where Ghostscript writes the result
 	local original_size_bytes                                                                                                       # Size before compression
+	local original_signature                                                                                                        # Last-modified time and size of the PDF when compression started, used to detect a re-download
 	local compressed_size_bytes                                                                                                     # Size of Ghostscript's output
 	local final_size_bytes                                                                                                          # Size of the file that will actually be committed
 	local saved_percent                                                                                                             # How much smaller the file became
@@ -358,10 +591,12 @@ function compress_and_stage_pdf() {                                             
 	fi                                                                                                                              # End of the verbosity check
 
 	original_size_bytes=$(stat -c %s -- "$pdf_path")                                                       # Record the original size in bytes
+	original_signature=$(stat -c '%Y %s' -- "$pdf_path")                                                   # Record the modification time and size, to notice if the PDF is replaced while we work
 	started_epoch=$(date +%s)                                                                              # Record the start time
 	log_message INFO "COMPRESSING ${position_text} '${pdf_path}' ($(format_bytes "$original_size_bytes"))" # Show which file is being compressed right now
-	cp -- "$pdf_path" "$temporary_input"                                                                   # Copy the PDF into the temporary directory
-	rm -f -- "$temporary_output"                                                                           # Remove any leftover output from a previous file
+	log_message TRACE "[file] copying '${pdf_path}' to '${temporary_input}'"
+	cp -- "$pdf_path" "$temporary_input" # Copy the PDF into the temporary directory
+	rm -f -- "$temporary_output"         # Remove any leftover output from a previous file
 
 	if ! run_logged_command "ghostscript ${pdf_path}" "$GHOSTSCRIPT_TIMEOUT_SECONDS" gs "${ghostscript_options[@]}" -sOutputFile="$temporary_output" "$temporary_input"; then # Run Ghostscript; every output line is labelled with the PDF name
 		fail_and_exit "Ghostscript failed or timed out for '${pdf_path}'."                                                                                                       # Stop on any compression failure
@@ -370,9 +605,17 @@ function compress_and_stage_pdf() {                                             
 		fail_and_exit "Ghostscript produced an empty file for '${pdf_path}'."                                                                                                    # Stop to avoid data loss
 	fi                                                                                                                                                                        # End of the empty-output check
 
-	compressed_size_bytes=$(stat -c %s -- "$temporary_output")                                                                                                 # Measure Ghostscript's output
-	if [[ $compressed_size_bytes -lt $original_size_bytes ]]; then                                                                                             # Only use the output if it is actually smaller
-		mv -- "$temporary_output" "$pdf_path"                                                                                                                     # Replace the original with the compressed version
+	if [[ "$(stat -c '%Y %s' -- "$pdf_path" 2>/dev/null || true)" != "$original_signature" ]]; then                                                                           # The PDF changed while Ghostscript was running (for example the downloader saved a new copy)
+		log_message WARN "'${pdf_path}' changed while it was being compressed (probably downloaded again); discarding the compressed copy, it will be handled in a later cycle." # Explain why nothing is replaced
+		rm -f -- "$temporary_input" "$temporary_output"                                                                                                                          # Remove both temporary files
+		return 0                                                                                                                                                                 # Never overwrite a file that was replaced in the meantime
+	fi                                                                                                                                                                        # End of the changed-while-compressing check
+
+	compressed_size_bytes=$(stat -c %s -- "$temporary_output")     # Measure Ghostscript's output
+	if [[ $compressed_size_bytes -lt $original_size_bytes ]]; then # Only use the output if it is actually smaller
+		log_message TRACE "[file] replacing '${pdf_path}' with the compressed copy"
+		mv -- "$temporary_output" "$pdf_path" # Replace the original with the compressed version
+		log_message TRACE "[file] setting permissions 644 on '${pdf_path}'"
 		chmod 644 -- "$pdf_path"                                                                                                                                  # mktemp files are 0600; restore normal permissions
 		saved_percent=$(((original_size_bytes - compressed_size_bytes) * 100 / original_size_bytes))                                                              # Work out the saving (original is non-zero here)
 		TOTAL_PDFS_COMPRESSED=$((TOTAL_PDFS_COMPRESSED + 1))                                                                                                      # Count the compressed PDF
@@ -402,7 +645,8 @@ function compress_and_stage_pdf() {                                             
 	log_message DEBUG "Staged '${pdf_path}'. Batch so far: $(format_bytes "$STAGED_BYTES") of $(format_bytes "$MAX_BATCH_BYTES")" # Show how full the batch is
 }                                                                                                                              # End of compress_and_stage_pdf
 
-function compress_pending_pdfs() {                                                                      # Compress and stage as many pending PDFs as fit in the batch
+function compress_pending_pdfs() {                                                                      # Compress and stage as many finished PDFs as fit in the batch
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                      # Log that this function was called, with its arguments
 	local staged_file_count                                                                                # Files already staged
 	local room_in_batch                                                                                    # How many more files may be staged
 	local pdf_path                                                                                         # Loop variable for each PDF
@@ -416,16 +660,23 @@ function compress_pending_pdfs() {                                              
 		return 0                                                                                              # Nothing to do this cycle
 	fi                                                                                                     # End of the room check
 
-	mapfile -d '' -t pending_pdfs < <(list_pdfs_to_compress "$room_in_batch" || true)                                            # Load the smallest unstaged PDFs (NUL-safe) into the array
-	pdf_total=${#pending_pdfs[@]}                                                                                                # Remember how many were selected
-	if [[ $pdf_total -eq 0 ]]; then                                                                                              # No PDFs waiting
-		log_message TRACE "No unstaged PDFs found this cycle."                                                                      # Log the empty result
-		return 0                                                                                                                    # Nothing to do this cycle
-	fi                                                                                                                           # End of the empty check
-	log_message INFO "Found ${pdf_total} unstaged PDF(s) to compress (smallest first; room for ${room_in_batch} in this batch)." # Log how many were found
-	verify_free_disk_space                                                                                                       # Make sure there is disk space before doing heavy work
-	STAGED_BYTES=$(count_staged_bytes)                                                                                           # Start from the real number of staged bytes
+	log_message DEBUG "Scanning for finished, unstaged PDFs (this can take a while when thousands of files are pending)..."                # Tell the operator why nothing happens for a moment
+	local scan_started_seconds=$SECONDS                                                                                                    # Remember when the scan started
+	mapfile -d '' -t pending_pdfs < <(list_pdfs_to_compress "$room_in_batch" || true)                                                      # Load the smallest finished, unstaged PDFs (NUL-safe) into the array
+	log_message DEBUG "Scan finished in $((SECONDS - scan_started_seconds))s: ${#pending_pdfs[@]} PDF(s) selected."                        # Report how long the scan took
+	pdf_total=${#pending_pdfs[@]}                                                                                                          # Remember how many were selected
+	if [[ $pdf_total -eq 0 ]]; then                                                                                                        # No finished PDFs waiting
+		log_message TRACE "No finished, unstaged PDFs found this cycle."                                                                      # Log the empty result
+		return 0                                                                                                                              # Nothing to do this cycle
+	fi                                                                                                                                     # End of the empty check
+	log_message INFO "Found ${pdf_total} finished, unstaged PDF(s) to compress (smallest first; room for ${room_in_batch} in this batch)." # Log how many were found
+	verify_free_disk_space                                                                                                                 # Make sure there is disk space before doing heavy work
+	STAGED_BYTES=$(count_staged_bytes)                                                                                                     # Start from the real number of staged bytes
 
+	local queued_path                                                                                                               # Loop variable for the queue listing
+	for queued_path in "${pending_pdfs[@]}"; do                                                                                     # Show the whole queue before compressing
+		log_message TRACE "[queue] ${queued_path}"                                                                                     # One line per queued PDF
+	done                                                                                                                            # End of the queue listing
 	for pdf_path in "${pending_pdfs[@]}"; do                                                                                        # Process each PDF in order
 		pdf_index=$((pdf_index + 1))                                                                                                   # Move the progress counter forward
 		if [[ $STAGED_BYTES -ge $MAX_BATCH_BYTES ]]; then                                                                              # The batch is big enough for one push
@@ -436,6 +687,10 @@ function compress_pending_pdfs() {                                              
 			log_message DEBUG "'${pdf_path}' no longer exists; skipping."                                                                 # Log the skip
 			continue                                                                                                                      # Go to the next PDF
 		fi                                                                                                                             # End of the existence check
+		if ! pdf_is_finished_downloading "$pdf_path"; then                                                                             # The list was built earlier; the downloader may have started a new download of this PDF since
+			log_message INFO "'${pdf_path}' is being downloaded again or changed since it was listed; skipping it for now."               # Explain the skip
+			continue                                                                                                                      # Go to the next PDF; it is picked up again once it has settled
+		fi                                                                                                                             # End of the finished-downloading re-check
 		compress_and_stage_pdf "$pdf_path" "[${pdf_index}/${pdf_total}]"                                                               # Compress the PDF and stage it
 	done                                                                                                                            # End of the PDF loop
 }                                                                                                                                # End of compress_pending_pdfs
@@ -443,6 +698,7 @@ function compress_pending_pdfs() {                                              
 # ---------------- Phase 2: Batch Push ----------------
 
 function refresh_batch_counters() {                                                                                                                                                                    # Update the counters used by the push decision
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                     # Log that this function was called, with its arguments
 	STAGED_FILE_COUNT=$(count_staged_files)                                                                                                                                                               # Number of files staged right now
 	STAGED_BYTES=$(count_staged_bytes)                                                                                                                                                                    # Total bytes staged right now
 	SECONDS_SINCE_LAST_PUSH=$(($(date +%s) - LAST_PUSH_EPOCH))                                                                                                                                            # Seconds since the last push
@@ -450,6 +706,7 @@ function refresh_batch_counters() {                                             
 }                                                                                                                                                                                                      # End of refresh_batch_counters
 
 function batch_is_ready() {                                                                                            # Succeeds (returns 0) when a push should happen now
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                     # Log that this function was called, with its arguments
 	if [[ $STAGED_FILE_COUNT -ge $MAX_BATCH_SIZE ]]; then                                                                 # A full batch is staged
 		log_message INFO "Push trigger: ${STAGED_FILE_COUNT} files staged (limit ${MAX_BATCH_SIZE})."                        # Log the reason
 		return 0                                                                                                             # Ready to push
@@ -466,6 +723,7 @@ function batch_is_ready() {                                                     
 }                                                                                                                      # End of batch_is_ready
 
 function stage_other_changed_files() {                 # Fill leftover batch room with non-PDF changes and deletions
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2     # Log that this function was called, with its arguments
 	local staged_file_count                               # Files already staged
 	local room_in_batch                                   # How many more files may be staged
 	local other_files=()                                  # Array holding the extra paths
@@ -488,6 +746,7 @@ function stage_other_changed_files() {                 # Fill leftover batch roo
 }                                                                                                                                       # End of stage_other_changed_files
 
 function commit_staged_batch() {                                                                         # Commit everything that is staged
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                       # Log that this function was called, with its arguments
 	local staged_file_count                                                                                 # Number of files in this commit
 	local commit_timestamp                                                                                  # UTC time for the commit message
 	local commit_message                                                                                    # Full commit message
@@ -503,6 +762,7 @@ function commit_staged_batch() {                                                
 }                                                                                                        # End of commit_staged_batch
 
 function pull_remote_changes() {                                                                                            # Rebase our new commit on top of the remote branch
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                          # Log that this function was called, with its arguments
 	log_message INFO "Pulling remote changes (rebase + autostash)..."                                                          # Log the start of the pull
 	if ! run_logged_command "git-pull" "$GIT_NETWORK_TIMEOUT_SECONDS" git pull --verbose --progress --rebase --autostash; then # Pull; autostash protects unstaged work
 		log_message WARN "Pull failed; aborting any half-finished rebase so the repository is left clean."                        # Explain the cleanup
@@ -513,6 +773,7 @@ function pull_remote_changes() {                                                
 }                                                                                                                           # End of pull_remote_changes
 
 function push_to_remote() {                                                                            # Push the committed batch to GitHub
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                     # Log that this function was called, with its arguments
 	log_message INFO "Pushing to remote repository..."                                                    # Log the start of the push
 	if ! run_logged_command "git-push" "$GIT_NETWORK_TIMEOUT_SECONDS" git push --verbose --progress; then # Push the commit(s)
 		fail_and_exit "Git push failed (network, permission, or file-size problem)."                         # Stop on push failure
@@ -520,6 +781,7 @@ function push_to_remote() {                                                     
 }                                                                                                      # End of push_to_remote
 
 function push_batch() {                                                                                                                                                                               # Run the full stage, commit, pull, push sequence
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                    # Log that this function was called, with its arguments
 	local staged_file_count                                                                                                                                                                              # Files in the batch after filling it
 	local batch_bytes                                                                                                                                                                                    # Bytes in the batch
 	local started_epoch                                                                                                                                                                                  # When this push sequence started
@@ -550,25 +812,32 @@ function push_batch() {                                                         
 
 # ---------------- Main ----------------
 
-function main() {                                             # Program entry point
-	log_message INFO "Auto git sync ${SCRIPT_VERSION} starting." # Log startup (console only)
-	verify_dependencies                                          # Make sure every tool exists
-	acquire_single_instance_lock                                 # Prevent duplicate instances
-	enter_repository_root                                        # Move into the repository
-	verify_remote_access                                         # Prove that pushing can work before doing any heavy work
-	prepare_work_directory                                       # Create the temporary directory
-	add_local_ignore_rule "*.part"                               # Never commit the downloader's half-finished *.pdf.part files
-	start_following_extra_logs                                   # Merge other apps' logs into this output, if configured
-	log_environment_report                                       # Log versions, settings and the starting state
-	verify_free_disk_space                                       # Check disk space once before starting
-	STARTED_EPOCH=$(date +%s)                                    # Record when the main loop starts
-	LAST_PUSH_EPOCH=$STARTED_EPOCH                               # Start the push timer now
-	LAST_HEARTBEAT_EPOCH=$STARTED_EPOCH                          # Start the heartbeat timer now
+function main() {                                                                                                                              # Program entry point
+	reject_arguments "$@"                                                                                                                         # The script takes no arguments: anything passed is rejected here
+	apply_options                                                                                                                                 # Combine flags, environment variables and defaults, and validate every value
+	enable_shell_trace_if_requested                                                                                                               # Print every shell command too, if --shell-trace was given
+	log_message INFO "Auto git sync ${SCRIPT_VERSION} starting."                                                                                  # Log startup (console only)
+	verify_dependencies                                                                                                                           # Make sure every tool exists
+	acquire_single_instance_lock                                                                                                                  # Prevent duplicate instances
+	enter_repository_root                                                                                                                         # Move into the repository
+	verify_remote_access                                                                                                                          # Prove that pushing can work before doing any heavy work
+	prepare_work_directory                                                                                                                        # Create the temporary directory
+	local ignore_pattern                                                                                                                          # Loop variable for the local ignore rules
+	for ignore_pattern in "*.part" "*.crdownload" "*.tmp" ".com.google.Chrome.*" ".org.chromium.Chromium.*" "**/assist_data/browser_profile/"; do # Half-finished downloads (downloader and Chrome), Chrome/Chromium temp names, and the Chrome profile folder with its caches and lock files
+		add_local_ignore_rule "$ignore_pattern"                                                                                                      # Add the rule to .git/info/exclude (never committed); the files stay on disk
+	done                                                                                                                                          # End of the ignore list
+	start_following_extra_logs                                                                                                                    # Merge other apps' logs into this output, if configured
+	log_all_options                                                                                                                               # Log EVERY option with its value, default, source and meaning
+	log_environment_report                                                                                                                        # Log versions, settings and the starting state
+	verify_free_disk_space                                                                                                                        # Check disk space once before starting
+	STARTED_EPOCH=$(date +%s)                                                                                                                     # Record when the main loop starts
+	LAST_PUSH_EPOCH=$STARTED_EPOCH                                                                                                                # Start the push timer now
+	LAST_HEARTBEAT_EPOCH=$STARTED_EPOCH                                                                                                           # Start the heartbeat timer now
 
 	while true; do                                                                       # Monitor the repository forever
 		CYCLE_NUMBER=$((CYCLE_NUMBER + 1))                                                  # Count this cycle
 		log_message TRACE "------ cycle ${CYCLE_NUMBER} begins ------"                      # Mark the start of the cycle in the output
-		compress_pending_pdfs                                                               # Phase 1: compress and stage PDFs
+		compress_pending_pdfs                                                               # Phase 1: compress and stage finished PDFs
 		refresh_batch_counters                                                              # Update staged count and elapsed time
 		if batch_is_ready; then                                                             # Phase 2: decide whether to push
 			push_batch                                                                         # Commit, pull and push the batch
