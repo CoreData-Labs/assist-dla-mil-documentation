@@ -157,6 +157,18 @@ The documents in `PDFs/` are shared so they can help power AI training, retrieva
 
 ---
 
+## 💻 Operating System Compatibility
+
+- 🐧 **Linux:** Required to run `main.py` and `upload.sh` for the current compression and upload workflow.
+- 🪟 **Windows:** You can browse the repository, open PDFs, and use the existing files without any issues.
+- 🍎 **macOS:** Same as Windows — you can access and use the existing documents normally.
+- 📂 **Just using the repository?** You don't need Linux if you're only reading PDFs, searching documents, or using the files already available.
+- 📤 **Adding or uploading new files?** You'll need Linux to run the current scripts for compression and uploading.
+
+**In short:** Use any operating system to access the existing files. Linux is only needed for the current file compression and upload workflow.
+
+---
+
 ## 💻 Running the script (`main.py`)
 
 If you are a developer looking to run or modify the included script (`main.py`), you'll need to set up your Python environment first. Open your terminal and run the following commands:
