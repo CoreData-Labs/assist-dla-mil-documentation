@@ -7,7 +7,7 @@
 # completeness (size, %PDF start, %%EOF end) and downloaded again automatically when it fails or looks incomplete.
 # MULTI-THREADED: the main thread owns the ONE Chrome window and walks the results pages; WORKER_COUNT worker
 # threads each connect to that same Chrome over a local debugging port and process documents in their OWN TABS.
-# Requires Python 3.13 or newer (it uses the `type` statement).
+# Requires Python 3.12 or newer (it uses the `type` statement).
 
 # ===========================================================================
 # IMPORTS
@@ -310,7 +310,7 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 HASH_CHUNK_BYTES = 1024 * 1024
 # How much of a "not a PDF" file is read to recognise a login page
 MAXIMUM_NON_PDF_BYTES = 2 * 1024 * 1024
-# On Windows, file paths are kept below this length (the hard limit is 260)
+# On Windows, keep complete paths below a conservative limit to leave room for temporary/suspect suffixes (legacy MAX_PATH is 260)
 MAXIMUM_WINDOWS_PATH_LENGTH = 240
 # The description part of a file name is never shortened below this many characters
 MINIMUM_DESCRIPTION_LENGTH = 10
@@ -1349,9 +1349,22 @@ def kill_chrome_processes() -> None:
                     and os.path.normcase(os.path.abspath(argument.split("=", 1)[1])) == profile_path
                 ):
                     # Report the kill
-                    logger.debug("Killing Chrome process %s", process.pid)
-                    # Stop it
-                    process.kill()
+                    logger.debug("Killing Chrome process tree rooted at %s", process.pid)
+                    # Chrome has child renderer/GPU/network processes; stop those before the browser process.
+                    try:
+                        children = process.children(recursive=True)
+                    except psutil.Error:
+                        children = []
+                    for child in reversed(children):
+                        try:
+                            child.kill()
+                        except psutil.Error:
+                            pass
+                    # Stop the browser process itself
+                    try:
+                        process.kill()
+                    except psutil.Error:
+                        pass
                     # Next process
                     break
         # Gone already or not allowed
@@ -1957,17 +1970,19 @@ def build_folder_name(*, document_record: DocumentRecord) -> str:
 
 # File name of a PDF (the folder already carries the document ID)
 def build_file_name(*, document_folder: Path, pdf_link: PdfLink) -> str:
-    # The date as YYYY-MM-DD (or cleaned text), reduced to safe characters
+    # Preserve the original filename convention: description_date_fileNumber.pdf.
+    # The date is formatted and sanitised exactly as in the original script.
     date_part = re.sub(
         pattern=r"[^A-Za-z0-9_]", repl="_", string=format_date_for_file_name(date_text=pdf_link["date_text"])
     )
-    # Collapse repeated underscores and trim the ends
+    # Collapse repeated underscores and trim the ends; do not invent a replacement date.
     date_part = re.sub(pattern=r"_+", repl="_", string=date_part).strip("_")
-    # Sanitised file number
+    # Sanitised file number, retaining the original configured length limit.
     number_part = sanitize_name_part(
         text=pdf_link["file_number"], maximum_length=FILE_NUMBER_MAXIMUM_LENGTH, fallback=FALLBACK_FILE_NUMBER
     )
-    # Everything except the description (2 = the joining underscores)
+    # Keep the original policy: shorten only the description on Windows, leaving the
+    # date and file number unchanged so existing filenames retain their format.
     fixed_length = (
         len(date_part)
         + len(number_part)
@@ -1976,25 +1991,28 @@ def build_file_name(*, document_folder: Path, pdf_link: PdfLink) -> str:
         + len(PDF_FILE_EXTENSION)
         + len(PARTIAL_FILE_EXTENSION)
     )
-    # Start with the normal limit
     description_limit = DESCRIPTION_MAXIMUM_LENGTH
-    # Windows has a 260 character path limit
     if os.name == "nt":
-        # Characters left for the description
         room_left = MAXIMUM_WINDOWS_PATH_LENGTH - len(str(document_folder.resolve())) - 1 - fixed_length
-        # Shorten the description if needed (but never below the minimum)
         description_limit = max(MINIMUM_DESCRIPTION_LENGTH, min(description_limit, room_left))
-    # Sanitised description
+    # Sanitised description.
     description_part = sanitize_name_part(
         text=pdf_link["description"], maximum_length=description_limit, fallback=FALLBACK_DESCRIPTION
     )
-    # Join the parts with underscores (empty parts are dropped), with no double underscores and none at the ends
+    # Join the original parts in the original order, dropping empty parts as before.
     file_name_base = re.sub(r"_+", "_", "_".join(filter(None, [description_part, date_part, number_part]))).strip("_")
-    # Add the extension
     file_name = file_name_base + PDF_FILE_EXTENSION
-    # Sanity check (an AssertionError is caught per document)
-    assert len(file_name) < 255, "file name too long"
-    # Hand the name back
+    # Preserve the original filename length assertion and add a clear Windows path check.
+    if len(file_name) >= 255:
+        raise OSError(errno.ENAMETOOLONG, "file name too long", file_name)
+    if os.name == "nt":
+        full_path = str(document_folder.resolve() / file_name)
+        longest_path = max(
+            len(full_path) + len(PARTIAL_FILE_EXTENSION),
+            len(str(build_suspect_path(target_path=document_folder / file_name))),
+        )
+        if longest_path > MAXIMUM_WINDOWS_PATH_LENGTH:
+            raise OSError(errno.ENAMETOOLONG, "full output path is too long for Windows", full_path)
     return file_name
 
 
