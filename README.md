@@ -174,6 +174,9 @@ The documents in `PDFs/` are shared so they can help power AI training, retrieva
 If you are a developer looking to run or modify the included script (`main.py`), you'll need to set up your Python environment first. Open your terminal and run the following commands:
 
 ```bash
+# Install required applications
+sudo apt-get install bash git ghostscript coreutils util-linux findutils grep sed gawk psmisc openssh-client ca-certificates python3 python3-pip python3-venv python3-lxml python3-psutil iputils-ping xvfb nodejs -y
+
 # Clone the repository
 git clone --depth 1 git@github.com:PrajwalKoirala638/assist-dla-mil-documentation.git
 
