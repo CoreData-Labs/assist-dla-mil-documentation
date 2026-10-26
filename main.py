@@ -200,19 +200,25 @@ JITTER_MINIMUM_FACTOR = 0.7
 JITTER_MAXIMUM_FACTOR = 1.3
 # True makes the browser window visible
 SHOW_BROWSER_WINDOW = True
+# True on Linux (Ubuntu, Debian, ...), where Chrome would otherwise use the GNOME key-ring / KWallet
+IS_LINUX = sys.platform.startswith("linux")
 # Chrome opens maximized and never shows the "Restore pages?" bubble or error dialogs
 BROWSER_LAUNCH_ARGUMENTS = [
     "--start-maximized",
     "--disable-session-crashed-bubble",
     "--hide-crash-restore-bubble",
     "--noerrdialogs",
+    # Linux only: store passwords and cookies in the profile folder instead of the system key-ring
+    *(["--password-store=basic"] if IS_LINUX else []),
 ]
-# Playwright flags that switch off Chrome's password manager (removed so saved passwords can be autofilled)
-BROWSER_IGNORED_DEFAULT_ARGUMENTS = [
-    "--enable-automation",
-    "--password-store=basic",
-    "--use-mock-keychain",
-]
+# Playwright default flags that are removed so Chrome's password manager still works
+BROWSER_IGNORED_DEFAULT_ARGUMENTS = (
+    # Linux: only the automation banner flag is removed; the key-ring stays disabled
+    ["--enable-automation"]
+    if IS_LINUX
+    # Windows and macOS keep the old behaviour
+    else ["--enable-automation", "--password-store=basic", "--use-mock-keychain"]
+)
 # How long to wait for Chrome to autofill the saved username and password
 AUTO_LOGIN_WAIT_SECONDS = 15
 # Timeout in milliseconds for each automatic click or wait
