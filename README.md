@@ -1,6 +1,6 @@
 # 🎓 Assist DLA Mil Documentation
 
-<img width="800" height="148" alt="welcome_new_middle" src="https://raw.githubusercontent.com/PrajwalKoirala638/assist-dla-mil-documentation/refs/heads/main/Assets/welcome_new_middle.gif" />
+<img width="800" height="148" alt="welcome_new_middle" src="https://raw.githubusercontent.com/CoreData-Labs/assist-dla-mil-documentation/refs/heads/main/Assets/welcome_new_middle.gif" />
 
 ### A friendly, organized home for education and benefits documents — built to help everyone, in every field, everywhere.
 
@@ -178,7 +178,7 @@ If you are a developer looking to run or modify the included script (`main.py`),
 sudo apt-get install bash git ghostscript coreutils util-linux findutils grep sed gawk psmisc openssh-client ca-certificates python3 python3-pip python3-venv python3-lxml python3-psutil iputils-ping xvfb nodejs -y
 
 # Clone the repository
-git clone --depth 1 git@github.com:PrajwalKoirala638/assist-dla-mil-documentation.git
+git clone --depth 1 git@github.com:CoreData-Labs/assist-dla-mil-documentation.git
 
 # Enter the folder
 cd assist-dla-mil-documentation
