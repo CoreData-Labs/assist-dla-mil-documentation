@@ -189,6 +189,9 @@ python3 -m venv .venv
 # Activate the virtual environment
 source .venv/bin/activate
 
+# Install the Python packages required by the project.
+pip install -r requirements.txt
+
 # Install the required Python packages
 pip install playwright lxml psutil
 
