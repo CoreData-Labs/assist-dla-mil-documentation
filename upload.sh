@@ -2,7 +2,7 @@
 # The shebang above must stand alone on its own line; a trailing comment would be passed to bash as a bogus argument.
 
 # -----------------------------------------------------------------------------
-# Auto Git Sync Script, production edition (strict: exits on ANY error)
+# Auto Git Sync Script, production edition (strict: exits on ANY error except network errors, which are retried)
 # Continuously watches a Git repository and does the following:
 # 1. Compresses each new or modified PDF (smallest first) as soon as it is found, then stages it.
 # 2. Uses the Git index (staging area) as the "already compressed" marker.
@@ -10,7 +10,8 @@
 #    passed since the last push (all three limits are settings, see the option table below).
 # 4. Commits BEFORE pulling, so the batch is a real commit rather than fragile staged state.
 # 5. Never stages a PDF that was not compressed by this script.
-# 6. Exits immediately if any command fails (run it under systemd with Restart=on-failure).
+# 6. Exits immediately if any command fails (run it under systemd with Restart=on-failure),
+#    EXCEPT network failures: a failed git pull, git push or git ls-remote is retried (see item 11).
 # 7. Shows EVERYTHING on the console only (no log file): this script, git, Ghostscript (page by page,
 #    labelled with the PDF being compressed) and, optionally, the logs of other apps such as the downloader.
 # 8. Ignores the downloader's half-finished '*.part' files and Chrome's temporary files and browser profile, so they
@@ -21,6 +22,9 @@
 #     while it was modified less than PDF_SETTLE_SECONDS ago, while another process still has it open, or while it
 #     does not start with the PDF signature. It is checked again right before compression, and the compressed copy is
 #     thrown away if the PDF changed while Ghostscript was running, so a re-download is never overwritten.
+# 11. Retries network problems: if the pull or the push fails, the WHOLE pull + push sequence is repeated after a
+#     wait that doubles each time (NETWORK_RETRY_DELAY_SECONDS up to NETWORK_RETRY_MAX_DELAY_SECONDS). A real rebase
+#     conflict is NOT a network problem, so the script aborts the rebase and exits instead.
 # The script takes NO command-line arguments: just run  bash upload.sh  (an argument is rejected with a clear message).
 # Every setting has a default and can be changed with an environment variable, e.g.  PDF_SETTLE_SECONDS=60 bash upload.sh
 # The value in use for EVERY setting, its default and where it came from are printed in the log at startup.
@@ -31,7 +35,7 @@
 
 set -Eeuo pipefail # Exit on errors, inherit the ERR trap in functions, fail on unset variables, fail on pipeline errors
 
-readonly SCRIPT_VERSION="2.6.0"                                                                                  # Version string shown in the startup report
+readonly SCRIPT_VERSION="2.7.0"                                                                                  # Version string shown in the startup report
 export LC_ALL=C                                                                                                  # Use plain byte-wise text handling so file names never confuse sort or grep
 export GIT_TERMINAL_PROMPT=0                                                                                     # Never let git wait for a password on a terminal nobody is watching
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30}" # Make SSH fail fast instead of hanging or prompting
@@ -45,26 +49,29 @@ fi                                                                              
 
 # The ONE table that defines every setting. Each entry is: ENVIRONMENT_VARIABLE|default|kind|meaning
 # kinds: int1 = whole number >= 1, int0 = whole number >= 0, bool = 0 or 1, level = 0 to 4, quality = Ghostscript preset, text = any text
-declare -ra OPTION_DEFINITIONS=(
-	"REPOSITORY_DIRECTORY|auto|text|Repository to watch (auto = the current directory)"
-	"CHECK_INTERVAL_SECONDS|5|int1|Seconds to sleep between repository checks"
-	"MAX_BATCH_SIZE|100|int1|Maximum number of files in one commit/push"
-	"MAX_BATCH_BYTES|1000000000|int1|Stop adding PDFs to a batch at about this many bytes (GitHub rejects pushes over about 2 GB)"
-	"MAX_SECONDS_BETWEEN_PUSHES|43200|int1|Force a push after this many seconds (43200 = 12 hours)"
-	"GITHUB_MAX_FILE_BYTES|104857600|int1|PDFs larger than this are ignored by Git (GitHub rejects files over 100 MiB)"
-	"GHOSTSCRIPT_QUALITY|/ebook|quality|Ghostscript preset: /screen, /ebook, /printer, /prepress or /default"
-	"GHOSTSCRIPT_TIMEOUT_SECONDS|21600|int1|Kill Ghostscript when one PDF takes longer than this many seconds"
-	"GIT_LOCAL_TIMEOUT_SECONDS|300|int1|Time limit in seconds for local git commands (add, commit)"
-	"GIT_NETWORK_TIMEOUT_SECONDS|3600|int1|Time limit in seconds for git commands that use the network (pull, push)"
-	"MIN_FREE_DISK_MB|1024|int0|Exit when free disk space drops below this many megabytes"
-	"HEARTBEAT_SECONDS|60|int1|How often to log an 'I am alive' status line"
-	"PDF_SETTLE_SECONDS|30|int0|A PDF must be unchanged for this many seconds before it counts as fully downloaded"
-	"LOG_EVERY_SKIPPED_PDF|1|bool|1 = log one line for every PDF that is skipped, 0 = log only the totals"
-	"LOG_LEVEL_NUMBER|0|level|Log detail: 0=TRACE (everything), 1=DEBUG, 2=INFO, 3=WARN, 4=FATAL"
-	"SHELL_TRACE|0|bool|1 = also print EVERY shell command with a timestamp (extremely verbose)"
-	"EXTRA_LOG_FILES||text|Space-separated log files of OTHER apps to merge into this console output"
-	"LOCK_FILE|auto|text|Lock file that prevents two copies running on one repository (auto = derived from the repository path)"
-)
+declare -ra OPTION_DEFINITIONS=( # Start of the read-only table of settings
+	"REPOSITORY_DIRECTORY|auto|text|Repository to watch (auto = the current directory)"                                            # Which repository to watch
+	"CHECK_INTERVAL_SECONDS|5|int1|Seconds to sleep between repository checks"                                                     # Pause between cycles
+	"MAX_BATCH_SIZE|100|int1|Maximum number of files in one commit/push"                                                           # File-count push limit
+	"MAX_BATCH_BYTES|1000000000|int1|Stop adding PDFs to a batch at about this many bytes (GitHub rejects pushes over about 2 GB)" # Byte-size push limit
+	"MAX_SECONDS_BETWEEN_PUSHES|43200|int1|Force a push after this many seconds (43200 = 12 hours)"                                # Time push limit
+	"GITHUB_MAX_FILE_BYTES|104857600|int1|PDFs larger than this are ignored by Git (GitHub rejects files over 100 MiB)"            # Per-file size limit
+	"GHOSTSCRIPT_QUALITY|/ebook|quality|Ghostscript preset: /screen, /ebook, /printer, /prepress or /default"                      # Compression quality
+	"GHOSTSCRIPT_TIMEOUT_SECONDS|21600|int1|Kill Ghostscript when one PDF takes longer than this many seconds"                     # Ghostscript time limit
+	"GIT_LOCAL_TIMEOUT_SECONDS|300|int1|Time limit in seconds for local git commands (add, commit)"                                # Local git time limit
+	"GIT_NETWORK_TIMEOUT_SECONDS|3600|int1|Time limit in seconds for git commands that use the network (pull, push)"               # Network git time limit
+	"NETWORK_RETRY_DELAY_SECONDS|30|int1|Seconds to wait before the first retry of a failed network operation (doubles each time)" # First retry wait
+	"NETWORK_RETRY_MAX_DELAY_SECONDS|600|int1|The wait between retries never grows beyond this many seconds"                       # Retry wait cap
+	"NETWORK_MAX_ATTEMPTS|0|int0|Give up (exit) after this many failed attempts in a row (0 = retry forever)"                      # Retry attempt limit
+	"MIN_FREE_DISK_MB|1024|int0|Exit when free disk space drops below this many megabytes"                                         # Free-disk minimum
+	"HEARTBEAT_SECONDS|60|int1|How often to log an 'I am alive' status line"                                                       # Heartbeat interval
+	"PDF_SETTLE_SECONDS|30|int0|A PDF must be unchanged for this many seconds before it counts as fully downloaded"                # Download settle time
+	"LOG_EVERY_SKIPPED_PDF|1|bool|1 = log one line for every PDF that is skipped, 0 = log only the totals"                         # Per-file skip logging
+	"LOG_LEVEL_NUMBER|0|level|Log detail: 0=TRACE (everything), 1=DEBUG, 2=INFO, 3=WARN, 4=FATAL"                                  # Log level
+	"SHELL_TRACE|0|bool|1 = also print EVERY shell command with a timestamp (extremely verbose)"                                   # Shell command tracing
+	"EXTRA_LOG_FILES||text|Space-separated log files of OTHER apps to merge into this console output"                              # Other apps' logs
+	"LOCK_FILE|auto|text|Lock file that prevents two copies running on one repository (auto = derived from the repository path)"   # Single-instance lock
+)                                                                                                                               # End of the table of settings
 
 declare -A OPTION_SOURCES=() # Where the final value of each setting came from: environment or default
 OPTIONS_APPLIED=0            # Becomes 1 once every setting has its final value (before that nothing is started)
@@ -240,6 +247,44 @@ function run_logged_command() {                                                 
 	return "$exit_code"                                                                                                                           # Hand the exit code back to the caller
 }                                                                                                                                              # End of run_logged_command
 
+# ---------------- Network Retry Helpers ----------------
+
+function wait_before_retry() {                           # Sleep before a retry in a way that a stop signal interrupts immediately
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2       # Log that this function was called, with its arguments
+	log_message INFO "Waiting ${1}s before trying again..." # Tell the operator how long the pause is
+	sleep "$1" &                                            # Sleep in the background so a stop signal is handled immediately
+	wait "$!" || true                                       # Wait for the sleep to finish (a signal interrupts this wait at once)
+}                                                        # End of wait_before_retry
+
+function next_retry_delay() {                         # Print the next wait: the current one doubled, but never above the cap
+	local delay=$(($1 * 2))                              # Double the current wait
+	if ((delay > NETWORK_RETRY_MAX_DELAY_SECONDS)); then # The doubled wait is above the cap
+		delay=$NETWORK_RETRY_MAX_DELAY_SECONDS              # Use the cap instead
+	fi                                                   # End of the cap check
+	printf '%s' "$delay"                                 # Print the result for the caller to capture
+}                                                     # End of next_retry_delay
+
+function retry_network_command() {                                         # Run one network command again and again until it succeeds
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                         # Log that this function was called, with its arguments
+	local source_label="$1"                                                   # Label shown in front of the command's output lines
+	local timeout_seconds="$2"                                                # Time limit for each single attempt
+	shift 2                                                                   # Everything after the first two arguments is the command itself
+	local attempt=0                                                           # How many attempts have been made so far
+	local delay=$NETWORK_RETRY_DELAY_SECONDS                                  # The wait before the next attempt (starts at the first-retry wait)
+	while true; do                                                            # Keep trying
+		attempt=$((attempt + 1))                                                 # Count this attempt
+		if run_logged_command "$source_label" "$timeout_seconds" "$@"; then      # Try the command
+			return 0                                                                # It worked, so stop retrying
+		fi                                                                       # End of the attempt
+		log_message WARN "[${source_label}] attempt ${attempt} failed."          # Say that this attempt failed
+		if ((NETWORK_MAX_ATTEMPTS > 0 && attempt >= NETWORK_MAX_ATTEMPTS)); then # An attempt limit is set and has been reached
+			return 1                                                                # Give up and let the caller decide what to do
+		fi                                                                       # End of the attempt-limit check
+		wait_before_retry "$delay"                                               # Wait before the next attempt
+		delay=$(next_retry_delay "$delay")                                       # Wait longer next time
+	done                                                                      # End of the retry loop
+}                                                                          # End of retry_network_command
+
 function start_following_extra_logs() {                                                                           # Merge other apps' log files into this console output
 	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                # Log that this function was called, with its arguments
 	local followed_log_file                                                                                          # Loop variable for each extra log file
@@ -300,7 +345,7 @@ function handle_unexpected_error() {               # Called by the ERR trap when
 
 function cleanup_on_exit() {                                         # Called by the EXIT trap on every exit path
 	local exit_code=$?                                                  # Capture the exit code first, before any other command changes it
-	if [[ $OPTIONS_APPLIED -eq 0 ]]; then                               # --help, --version or a bad flag: nothing was started, so there is nothing to clean up
+	if [[ $OPTIONS_APPLIED -eq 0 ]]; then                               # A bad option or argument: nothing was started, so there is nothing to clean up
 		return 0                                                           # Leave quietly (the exit code is not changed)
 	fi                                                                  # End of the early-exit check
 	local follower_pid                                                  # Loop variable for background log followers
@@ -376,8 +421,8 @@ function verify_remote_access() {                                               
 	remote_name="${upstream_name%%/*}"                                                               # The remote is the part before the first slash
 	remote_url=$(git remote get-url "$remote_name" | sed -e 's#//[^/@]*@#//***@#')                   # Read the URL and hide user:token@ credentials
 	log_message INFO "Upstream branch: ${upstream_name}; remote '${remote_name}' URL: ${remote_url}" # Log where we push to
-	if ! run_logged_command "git-ls-remote" 120 git ls-remote --heads "$remote_name"; then           # Prove that the network and credentials work
-		fail_and_exit "Cannot reach remote '${remote_name}' (network or credentials problem)."          # Stop now instead of after a long compression run
+	if ! retry_network_command "git-ls-remote" 120 git ls-remote --heads "$remote_name"; then        # Prove that the network and credentials work (retried when the network is down)
+		fail_and_exit "Cannot reach remote '${remote_name}' (network or credentials problem)."          # Stop only when the attempt limit is reached
 	fi                                                                                               # End of the remote check
 }                                                                                                 # End of verify_remote_access
 
@@ -417,6 +462,7 @@ function log_environment_report() {                                             
 	log_message INFO "Ghostscript: quality ${GHOSTSCRIPT_QUALITY}, timeout ${GHOSTSCRIPT_TIMEOUT_SECONDS}s; GitHub file limit ${GITHUB_MAX_FILE_BYTES} bytes"                                                                                                                        # Compression settings
 	log_message INFO "Downloads: PDFs are compressed only when no .part file exists and they were unchanged for ${PDF_SETTLE_SECONDS}s"                                                                                                                                              # Download-safety settings
 	log_message INFO "Timeouts: local git ${GIT_LOCAL_TIMEOUT_SECONDS}s, network git ${GIT_NETWORK_TIMEOUT_SECONDS}s; minimum free disk ${MIN_FREE_DISK_MB} MB"                                                                                                                      # Safety settings
+	log_message INFO "Network retries: first wait ${NETWORK_RETRY_DELAY_SECONDS}s (doubling, capped at ${NETWORK_RETRY_MAX_DELAY_SECONDS}s), maximum attempts ${NETWORK_MAX_ATTEMPTS} (0 = retry forever)"                                                                           # Retry settings
 	log_message INFO "Logging: console only, level ${LOG_LEVEL_NUMBER}, heartbeat ${HEARTBEAT_SECONDS}s, extra logs '${EXTRA_LOG_FILES}', every skipped PDF logged ${LOG_EVERY_SKIPPED_PDF}, shell trace ${SHELL_TRACE:-0}"                                                          # Logging settings
 	log_message INFO "===== END OF STARTUP REPORT ====="                                                                                                                                                                                                                             # End of the report
 }                                                                                                                                                                                                                                                                                 # End of log_environment_report
@@ -594,9 +640,9 @@ function compress_and_stage_pdf() {                                             
 	original_signature=$(stat -c '%Y %s' -- "$pdf_path")                                                   # Record the modification time and size, to notice if the PDF is replaced while we work
 	started_epoch=$(date +%s)                                                                              # Record the start time
 	log_message INFO "COMPRESSING ${position_text} '${pdf_path}' ($(format_bytes "$original_size_bytes"))" # Show which file is being compressed right now
-	log_message TRACE "[file] copying '${pdf_path}' to '${temporary_input}'"
-	cp -- "$pdf_path" "$temporary_input" # Copy the PDF into the temporary directory
-	rm -f -- "$temporary_output"         # Remove any leftover output from a previous file
+	log_message TRACE "[file] copying '${pdf_path}' to '${temporary_input}'"                               # Log the copy into the temporary directory
+	cp -- "$pdf_path" "$temporary_input"                                                                   # Copy the PDF into the temporary directory
+	rm -f -- "$temporary_output"                                                                           # Remove any leftover output from a previous file
 
 	if ! run_logged_command "ghostscript ${pdf_path}" "$GHOSTSCRIPT_TIMEOUT_SECONDS" gs "${ghostscript_options[@]}" -sOutputFile="$temporary_output" "$temporary_input"; then # Run Ghostscript; every output line is labelled with the PDF name
 		fail_and_exit "Ghostscript failed or timed out for '${pdf_path}'."                                                                                                       # Stop on any compression failure
@@ -611,11 +657,11 @@ function compress_and_stage_pdf() {                                             
 		return 0                                                                                                                                                                 # Never overwrite a file that was replaced in the meantime
 	fi                                                                                                                                                                        # End of the changed-while-compressing check
 
-	compressed_size_bytes=$(stat -c %s -- "$temporary_output")     # Measure Ghostscript's output
-	if [[ $compressed_size_bytes -lt $original_size_bytes ]]; then # Only use the output if it is actually smaller
-		log_message TRACE "[file] replacing '${pdf_path}' with the compressed copy"
-		mv -- "$temporary_output" "$pdf_path" # Replace the original with the compressed version
-		log_message TRACE "[file] setting permissions 644 on '${pdf_path}'"
+	compressed_size_bytes=$(stat -c %s -- "$temporary_output")                                                                                                 # Measure Ghostscript's output
+	if [[ $compressed_size_bytes -lt $original_size_bytes ]]; then                                                                                             # Only use the output if it is actually smaller
+		log_message TRACE "[file] replacing '${pdf_path}' with the compressed copy"                                                                               # Log the replacement
+		mv -- "$temporary_output" "$pdf_path"                                                                                                                     # Replace the original with the compressed version
+		log_message TRACE "[file] setting permissions 644 on '${pdf_path}'"                                                                                       # Log the permission change
 		chmod 644 -- "$pdf_path"                                                                                                                                  # mktemp files are 0600; restore normal permissions
 		saved_percent=$(((original_size_bytes - compressed_size_bytes) * 100 / original_size_bytes))                                                              # Work out the saving (original is non-zero here)
 		TOTAL_PDFS_COMPRESSED=$((TOTAL_PDFS_COMPRESSED + 1))                                                                                                      # Count the compressed PDF
@@ -761,24 +807,43 @@ function commit_staged_batch() {                                                
 	log_message INFO "Commit created: $(git rev-parse --short HEAD)"                                        # Log the new commit's short hash
 }                                                                                                        # End of commit_staged_batch
 
-function pull_remote_changes() {                                                                                            # Rebase our new commit on top of the remote branch
+function rebase_is_in_progress() {                                                                    # Succeeds when a rebase is stuck half-way (a conflict, which is not a network problem)
+	[[ -d "$(git rev-parse --git-path rebase-merge)" || -d "$(git rev-parse --git-path rebase-apply)" ]] # Git keeps one of these directories while a rebase is unfinished
+}                                                                                                     # End of rebase_is_in_progress
+
+function pull_and_push_once() {                                                                                             # One attempt: pull (rebase), then push; returns non-zero on any failure
 	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                          # Log that this function was called, with its arguments
 	log_message INFO "Pulling remote changes (rebase + autostash)..."                                                          # Log the start of the pull
 	if ! run_logged_command "git-pull" "$GIT_NETWORK_TIMEOUT_SECONDS" git pull --verbose --progress --rebase --autostash; then # Pull; autostash protects unstaged work
-		log_message WARN "Pull failed; aborting any half-finished rebase so the repository is left clean."                        # Explain the cleanup
-		git rebase --abort || true                                                                                                # Abort a rebase in progress (harmless if none exists)
-		fail_and_exit "Failed to pull/rebase from the remote repository."                                                         # Stop on pull failure
+		return 1                                                                                                                  # The caller decides what this failure means
 	fi                                                                                                                         # End of the pull check
-	log_message DEBUG "Pull completed (or already up to date)."                                                                # Log success
-}                                                                                                                           # End of pull_remote_changes
+	log_message DEBUG "Pull completed (or already up to date)."                                                                # Log the pull success
+	log_message INFO "Pushing to remote repository..."                                                                         # Log the start of the push
+	run_logged_command "git-push" "$GIT_NETWORK_TIMEOUT_SECONDS" git push --verbose --progress                                 # Push (its exit code is this function's result)
+}                                                                                                                           # End of pull_and_push_once
 
-function push_to_remote() {                                                                            # Push the committed batch to GitHub
-	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                     # Log that this function was called, with its arguments
-	log_message INFO "Pushing to remote repository..."                                                    # Log the start of the push
-	if ! run_logged_command "git-push" "$GIT_NETWORK_TIMEOUT_SECONDS" git push --verbose --progress; then # Push the commit(s)
-		fail_and_exit "Git push failed (network, permission, or file-size problem)."                         # Stop on push failure
-	fi                                                                                                    # End of the push check
-}                                                                                                      # End of push_to_remote
+function sync_with_remote() {                                                                     # Pull and push, repeating the whole sequence after network failures
+	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                # Log that this function was called, with its arguments
+	local attempt=0                                                                                  # How many attempts have been made so far
+	local delay=$NETWORK_RETRY_DELAY_SECONDS                                                         # The wait before the next attempt (starts at the first-retry wait)
+	while true; do                                                                                   # Keep trying
+		attempt=$((attempt + 1))                                                                        # Count this attempt
+		if pull_and_push_once; then                                                                     # Try pull + push
+			log_message DEBUG "Pull and push succeeded on attempt ${attempt}."                             # Log the success
+			return 0                                                                                       # Done
+		fi                                                                                              # End of the attempt
+		if rebase_is_in_progress; then                                                                  # A rebase conflict: retrying cannot fix it
+			git rebase --abort || true                                                                     # Leave the repository clean (harmless if nothing is in progress)
+			fail_and_exit "Rebase conflict while pulling; a person must resolve it."                       # Stop, because a person has to decide
+		fi                                                                                              # End of the conflict check
+		log_message WARN "Pull/push failed (attempt ${attempt}); assuming a network or remote problem." # Say what we assume
+		if ((NETWORK_MAX_ATTEMPTS > 0 && attempt >= NETWORK_MAX_ATTEMPTS)); then                        # An attempt limit is set and has been reached
+			fail_and_exit "Pull/push still failing after ${attempt} attempts."                             # Stop and let systemd restart the script
+		fi                                                                                              # End of the attempt-limit check
+		wait_before_retry "$delay"                                                                      # Wait before the next attempt
+		delay=$(next_retry_delay "$delay")                                                              # Wait longer next time
+	done                                                                                             # End of the retry loop
+}                                                                                                 # End of sync_with_remote
 
 function push_batch() {                                                                                                                                                                               # Run the full stage, commit, pull, push sequence
 	log_message TRACE "[call] ${FUNCNAME[0]}($*)" >&2                                                                                                                                                    # Log that this function was called, with its arguments
@@ -797,9 +862,8 @@ function push_batch() {                                                         
 	batch_bytes=$(count_staged_bytes)                                                                                                                                                                    # Measure the batch before committing
 	started_epoch=$(date +%s)                                                                                                                                                                            # Record the start time
 	log_message INFO "PUSH STARTING: ${staged_file_count} file(s), $(format_bytes "$batch_bytes")"                                                                                                       # Announce the push
-	commit_staged_batch                                                                                                                                                                                  # Commit the batch
-	pull_remote_changes                                                                                                                                                                                  # Rebase onto the latest remote state
-	push_to_remote                                                                                                                                                                                       # Push the batch
+	commit_staged_batch                                                                                                                                                                                  # Commit the batch (once, so retries never create duplicate commits)
+	sync_with_remote                                                                                                                                                                                     # Pull and push, retrying the whole sequence on network failures
 	elapsed_seconds=$(($(date +%s) - started_epoch))                                                                                                                                                     # Measure the whole sequence
 	bytes_per_second=$((batch_bytes / (elapsed_seconds > 0 ? elapsed_seconds : 1)))                                                                                                                      # Average throughput (avoid dividing by zero)
 	TOTAL_PUSHES=$((TOTAL_PUSHES + 1))                                                                                                                                                                   # Count the push
@@ -814,13 +878,13 @@ function push_batch() {                                                         
 
 function main() {                                                                                                                              # Program entry point
 	reject_arguments "$@"                                                                                                                         # The script takes no arguments: anything passed is rejected here
-	apply_options                                                                                                                                 # Combine flags, environment variables and defaults, and validate every value
-	enable_shell_trace_if_requested                                                                                                               # Print every shell command too, if --shell-trace was given
+	apply_options                                                                                                                                 # Combine environment variables and defaults, and validate every value
+	enable_shell_trace_if_requested                                                                                                               # Print every shell command too, if SHELL_TRACE=1 was given
 	log_message INFO "Auto git sync ${SCRIPT_VERSION} starting."                                                                                  # Log startup (console only)
 	verify_dependencies                                                                                                                           # Make sure every tool exists
 	acquire_single_instance_lock                                                                                                                  # Prevent duplicate instances
 	enter_repository_root                                                                                                                         # Move into the repository
-	verify_remote_access                                                                                                                          # Prove that pushing can work before doing any heavy work
+	verify_remote_access                                                                                                                          # Prove that pushing can work before doing any heavy work (retried on network failure)
 	prepare_work_directory                                                                                                                        # Create the temporary directory
 	local ignore_pattern                                                                                                                          # Loop variable for the local ignore rules
 	for ignore_pattern in "*.part" "*.crdownload" "*.tmp" ".com.google.Chrome.*" ".org.chromium.Chromium.*" "**/assist_data/browser_profile/"; do # Half-finished downloads (downloader and Chrome), Chrome/Chromium temp names, and the Chrome profile folder with its caches and lock files
@@ -840,7 +904,7 @@ function main() {                                                               
 		compress_pending_pdfs                                                               # Phase 1: compress and stage finished PDFs
 		refresh_batch_counters                                                              # Update staged count and elapsed time
 		if batch_is_ready; then                                                             # Phase 2: decide whether to push
-			push_batch                                                                         # Commit, pull and push the batch
+			push_batch                                                                         # Commit, pull and push the batch (network failures are retried inside)
 		fi                                                                                  # End of the push decision
 		log_heartbeat_if_due                                                                # Log a status line once per heartbeat interval
 		log_message TRACE "cycle ${CYCLE_NUMBER} done; sleeping ${CHECK_INTERVAL_SECONDS}s" # Log the pause
